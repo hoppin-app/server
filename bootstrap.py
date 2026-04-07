@@ -44,7 +44,8 @@ MSG_CONNECT_ACCEPT= 0x09
 MSG_CONNECT_DECLINE=0x0A
 MSG_CHAT          = 0x0B
 MSG_CHAT_ACK      = 0x0C
-MSG_HOLE_PUNCH    = 0x0D   # New: coordinate hole punching
+MSG_HOLE_PUNCH    = 0x0D   # Coordinate hole punching
+MSG_RELAY         = 0x0E   # TURN-style relay for symmetric NAT fallback
 
 K = 20   # Kademlia bucket size
 
@@ -192,6 +193,9 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         # we send both sides each other's address simultaneously.
         self._hp_waiters: Dict[str, tuple] = {}
 
+        # relay stats for logging
+        self._relay_count: int = 0
+
     def connection_made(self, transport):
         self.transport = transport
         log.info(f"Bootstrap server listening on UDP :{PORT}")
@@ -227,6 +231,9 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
 
         elif msg_type == MSG_CONNECT_REQ:
             self._handle_connect_request(msg, tx_id, addr, phone, ip, port)
+
+        elif msg_type == MSG_RELAY:
+            self._handle_relay(msg, addr, phone)
 
     def _handle_ping(self, tx_id: str, addr, phone: str, ip: str, port: int):
         """Reply with PONG + inject the peer's own public address as a STORE."""
@@ -335,22 +342,84 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         # Tell requester (A) about target (B)'s public address
         notify_a = make_message(
             MSG_HOLE_PUNCH,
+            transactionID=tx_id,
             key=target_phone,
             value=f"{target_peer.ip}:{target_peer.port}",
-            senderPhone=target_phone,
         )
         self._send(notify_a, addr)
 
         # Tell target (B) about requester (A)'s public address
         notify_b = make_message(
             MSG_HOLE_PUNCH,
+            transactionID=tx_id,
             key=requester_phone,
             value=f"{requester_ip}:{requester_port}",
-            senderPhone=requester_phone,
         )
         self._send(notify_b, (target_peer.ip, target_peer.port))
 
         log.info(f"  Hole punch coords sent to both sides")
+
+    def _handle_relay(self, msg: dict, sender_addr, sender_phone: str):
+        """
+        TURN-style relay fallback for symmetric NAT.
+
+        The sender wraps its real payload inside a RELAY message:
+          key   = destination phone number
+          value = JSON-encoded inner KadMessage (the actual payload)
+
+        Bootstrap unwraps it and forwards to the destination's last known
+        public address, rewriting senderIP/senderPort so the receiver can
+        reply back through the relay too.
+
+        Flow:
+          A  --RELAY(key=B, value=innerMsg)--> bootstrap
+          bootstrap --RELAY(key=A, value=innerMsg, from A's public addr)--> B
+          B  --RELAY(key=A, value=replyMsg)--> bootstrap
+          bootstrap --RELAY(key=B, value=replyMsg, from B's public addr)--> A
+        """
+        target_phone = msg.get("key", "")
+        inner_json   = msg.get("value", "")
+
+        if not target_phone or not inner_json:
+            log.warning(f"  RELAY from {sender_phone}: missing key or value")
+            return
+
+        target_peer = self.registry.get(target_phone)
+        if not target_peer:
+            log.info(f"  RELAY: {target_phone} not in registry, dropping")
+            # Optionally tell sender the target is offline
+            decline = make_message(MSG_CONNECT_DECLINE,
+                                   key=target_phone,
+                                   value="offline")
+            self._send(decline, sender_addr)
+            return
+
+        # Validate inner payload is JSON we can decode (don't forward garbage)
+        try:
+            inner_msg = json.loads(inner_json)
+        except Exception:
+            log.warning(f"  RELAY from {sender_phone}: inner payload not valid JSON")
+            return
+
+        # Stamp the sender's real public address so the receiver knows who
+        # sent it and can reply via relay using the correct source.
+        inner_msg["senderIP"]   = sender_addr[0]
+        inner_msg["senderPort"] = sender_addr[1]
+
+        # Wrap in a new RELAY envelope addressed to the target
+        forward = make_message(
+            MSG_RELAY,
+            key=sender_phone,               # so receiver knows who to reply to
+            value=json.dumps(inner_msg),    # re-serialised inner message
+        )
+        self._send(forward, (target_peer.ip, target_peer.port))
+
+        self._relay_count += 1
+        if self._relay_count % 100 == 1:
+            log.info(f"  [relay] total forwarded: {self._relay_count}")
+        else:
+            log.debug(f"  RELAY {sender_phone} -> {target_phone} "
+                      f"({len(inner_json)} bytes)")
 
     def _send(self, msg: dict, addr):
         try:
@@ -365,7 +434,7 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
             0x04: "FOUND_NODE", 0x05: "STORE", 0x06: "FIND_VALUE",
             0x07: "FOUND_VALUE", 0x08: "CONNECT_REQ", 0x09: "CONNECT_ACCEPT",
             0x0A: "CONNECT_DECLINE", 0x0B: "CHAT", 0x0C: "CHAT_ACK",
-            0x0D: "HOLE_PUNCH",
+            0x0D: "HOLE_PUNCH", 0x0E: "RELAY",
         }
         return names.get(t, f"UNKNOWN(0x{t:02X})")
 
