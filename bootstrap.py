@@ -4,12 +4,12 @@ HopChat Bootstrap Server
 ========================
 A lightweight Kademlia bootstrap node + UDP hole punching coordinator.
 
-Deploy on any VPS with a public IP:
-    pip install -r requirements.txt
-    python3 bootstrap.py
-
 Listens on UDP port 4001 by default.
 All messages use the same JSON format as the iOS app.
+
+libp2p update: NodeIDs are now SHA-256 (32 bytes / 256 bits) to match
+the updated iOS client. The PeerRegistry XOR distance comparison works
+on arbitrary-length hex strings so no routing logic needed to change.
 """
 
 import asyncio
@@ -19,7 +19,7 @@ import hashlib
 import uuid
 import logging
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 logging.basicConfig(
@@ -32,20 +32,20 @@ log = logging.getLogger("hopchat-bootstrap")
 PORT = int(os.environ.get("HOPCHAT_PORT", 4001))
 
 # Message type constants (must match iOS KadMessageType)
-MSG_PING          = 0x01
-MSG_PONG          = 0x02
-MSG_FIND_NODE     = 0x03
-MSG_FOUND_NODE    = 0x04
-MSG_STORE         = 0x05
-MSG_FIND_VALUE    = 0x06
-MSG_FOUND_VALUE   = 0x07
-MSG_CONNECT_REQ   = 0x08
-MSG_CONNECT_ACCEPT= 0x09
-MSG_CONNECT_DECLINE=0x0A
-MSG_CHAT          = 0x0B
-MSG_CHAT_ACK      = 0x0C
-MSG_HOLE_PUNCH    = 0x0D   # Coordinate hole punching
-MSG_RELAY         = 0x0E   # TURN-style relay for symmetric NAT fallback
+MSG_PING           = 0x01
+MSG_PONG           = 0x02
+MSG_FIND_NODE      = 0x03
+MSG_FOUND_NODE     = 0x04
+MSG_STORE          = 0x05
+MSG_FIND_VALUE     = 0x06
+MSG_FOUND_VALUE    = 0x07
+MSG_CONNECT_REQ    = 0x08
+MSG_CONNECT_ACCEPT = 0x09
+MSG_CONNECT_DECLINE= 0x0A
+MSG_CHAT           = 0x0B
+MSG_CHAT_ACK       = 0x0C
+MSG_HOLE_PUNCH     = 0x0D   # Coordinate hole punching
+MSG_RELAY          = 0x0E   # TURN-style relay for symmetric NAT fallback
 
 K = 20   # Kademlia bucket size
 
@@ -56,11 +56,13 @@ K = 20   # Kademlia bucket size
 
 @dataclass
 class PeerInfo:
-    node_id:    str        # hex node ID
-    phone:      str
-    ip:         str        # public IP seen by server
-    port:       int        # public port seen by server
-    last_seen:  float      # unix timestamp
+    node_id:   str    # hex node ID (64 hex chars = 32 bytes = SHA-256)
+    phone:     str
+    ip:        str    # public IP seen by server
+    port:      int    # public port seen by server
+    last_seen: float  # unix timestamp
+    lan_ip:    str = ""
+    lan_port:  int = 0
 
 
 class PeerRegistry:
@@ -68,9 +70,11 @@ class PeerRegistry:
         self._peers: Dict[str, PeerInfo] = {}   # phone -> PeerInfo
         self._ttl = ttl
 
-    def upsert(self, phone: str, node_id: str, ip: str, port: int) -> PeerInfo:
+    def upsert(self, phone: str, node_id: str, ip: str, port: int,
+               lan_ip: str = "", lan_port: int = 0) -> PeerInfo:
         info = PeerInfo(node_id=node_id, phone=phone,
-                        ip=ip, port=port, last_seen=time.time())
+                        ip=ip, port=port, last_seen=time.time(),
+                        lan_ip=lan_ip or ip, lan_port=lan_port or port)
         self._peers[phone] = info
         return info
 
@@ -80,12 +84,12 @@ class PeerRegistry:
             return p
         return None
 
-    def all_live(self) -> list[PeerInfo]:
+    def all_live(self) -> list:
         now = time.time()
         return [p for p in self._peers.values()
                 if (now - p.last_seen) < self._ttl]
 
-    def closest(self, target_id_hex: str, k: int = K) -> list[PeerInfo]:
+    def closest(self, target_id_hex: str, k: int = K) -> list:
         """Return up to k peers closest (XOR distance) to target_id_hex."""
         target = int(target_id_hex, 16)
         live = self.all_live()
@@ -106,7 +110,7 @@ class PeerRegistry:
 
 class KVStore:
     def __init__(self, ttl: int = 600):
-        self._data: Dict[str, tuple[str, float]] = {}
+        self._data: Dict[str, tuple] = {}
         self._ttl = ttl
 
     def put(self, key: str, value: str):
@@ -126,14 +130,16 @@ class KVStore:
 
 
 # ---------------------------------------------------------------------------
-# Node ID helpers
+# Node ID helpers  —  SHA-256 (32 bytes / 256 bits, matching iOS client)
 # ---------------------------------------------------------------------------
 
 def node_id_from_phone(phone: str) -> str:
-    return hashlib.sha1(phone.encode()).hexdigest()
+    """Deterministic 256-bit NodeID from a phone string (hex, 64 chars)."""
+    return hashlib.sha256(phone.encode()).hexdigest()
 
 def bootstrap_node_id() -> str:
-    return hashlib.sha1(b"hopchat-bootstrap-server").hexdigest()
+    """Fixed NodeID for this bootstrap server (256-bit)."""
+    return hashlib.sha256(b"hopchat-bootstrap-server").hexdigest()
 
 BOOTSTRAP_ID = bootstrap_node_id()
 
@@ -144,29 +150,37 @@ BOOTSTRAP_ID = bootstrap_node_id()
 
 def make_message(msg_type: int, **kwargs) -> dict:
     return {
-        "type":        msg_type,
-        "senderID":    list(bytes.fromhex(BOOTSTRAP_ID)),
-        "senderIP":    "0.0.0.0",   # clients ignore bootstrap's IP for routing
-        "senderPort":  PORT,
-        "senderPhone": "bootstrap",
+        "type":          msg_type,
+        # senderID is now 32 bytes (SHA-256). list() on bytes() gives [int…].
+        "senderID":      list(bytes.fromhex(BOOTSTRAP_ID)),
+        "senderIP":      "0.0.0.0",   # clients ignore bootstrap's IP for routing
+        "senderPort":    PORT,
+        "senderPhone":   "bootstrap",
         "transactionID": str(uuid.uuid4()),
-        "targetID":    None,
-        "peers":       None,
-        "key":         None,
-        "value":       None,
-        "chatBody":    None,
-        "chatID":      None,
+        "targetID":      None,
+        "peers":         None,
+        "key":           None,
+        "value":         None,
+        "chatBody":      None,
+        "chatID":        None,
         "chatTimestamp": None,
         **kwargs,
     }
 
-def peer_to_codable(p: PeerInfo) -> dict:
+def peer_to_codable(p: PeerInfo, requester_ip: str = None) -> dict:
+    """
+    Return the best address for a peer given who's asking.
+    If the requester shares a public IP with the peer they are behind the
+    same NAT, so we return the LAN address for direct local communication.
+    """
+    use_lan = requester_ip and requester_ip == p.ip
     return {
-        "id":    list(bytes.fromhex(p.node_id)),
-        "ip":    p.ip,
-        "port":  p.port,
+        "id":    list(bytes.fromhex(p.node_id)),   # 32 bytes for SHA-256
+        "ip":    p.lan_ip  if use_lan else p.ip,
+        "port":  p.lan_port if use_lan else p.port,
         "phone": p.phone,
     }
+
 
 def encode(msg: dict) -> bytes:
     return json.dumps(msg).encode()
@@ -188,12 +202,6 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         self.kv       = KVStore(ttl=600)
         self.transport: asyncio.DatagramTransport = None
 
-        # hole_punch_waiters: phone -> (addr, loop future)
-        # When A wants to reach B, we note A is waiting; when B contacts us
-        # we send both sides each other's address simultaneously.
-        self._hp_waiters: Dict[str, tuple] = {}
-
-        # relay stats for logging
         self._relay_count: int = 0
 
     def connection_made(self, transport):
@@ -205,29 +213,45 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         if not msg:
             return
 
-        ip, port = addr
-        phone    = msg.get("senderPhone", "unknown")
+        ip, port  = addr
+        phone     = msg.get("senderPhone", "unknown")
         node_id_bytes = msg.get("senderID", [])
-        node_id  = bytes(node_id_bytes).hex() if node_id_bytes else node_id_from_phone(phone)
-        tx_id    = msg.get("transactionID", str(uuid.uuid4()))
-        msg_type = msg.get("type", 0)
 
-        # Always register/refresh the peer with their REAL public address
-        if phone != "unknown" and phone != "bootstrap":
-            self.registry.upsert(phone, node_id, ip, port)
-            log.info(f"[{phone}] {self._type_name(msg_type)} from {ip}:{port}")
+        # senderID is 32 bytes (SHA-256). Fall back to deriving from phone if
+        # the field is missing or has the old 20-byte SHA-1 length.
+        if len(node_id_bytes) == 32:
+            node_id = bytes(node_id_bytes).hex()
+        else:
+            # Old client or missing field — derive deterministically.
+            node_id = node_id_from_phone(phone)
+            if node_id_bytes:
+                log.warning(f"  [{phone}] senderID has unexpected length "
+                            f"{len(node_id_bytes)} bytes — using derived SHA-256 ID")
+
+        tx_id     = msg.get("transactionID", str(uuid.uuid4()))
+        msg_type  = msg.get("type", 0)
+
+        # senderIP/senderPort in the payload is the client's LAN address.
+        # `addr` (ip, port) is the real public address the OS observed.
+        lan_ip    = msg.get("senderIP", ip)
+        lan_port  = msg.get("senderPort", port)
+
+        if phone not in ("unknown", "bootstrap"):
+            self.registry.upsert(phone, node_id, ip, port, lan_ip, lan_port)
+            log.info(f"[{phone}] {self._type_name(msg_type)} from {ip}:{port}"
+                     f" (LAN {lan_ip}:{lan_port})")
 
         if msg_type == MSG_PING:
             self._handle_ping(tx_id, addr, phone, ip, port)
 
         elif msg_type == MSG_FIND_NODE:
-            self._handle_find_node(msg, tx_id, addr)
+            self._handle_find_node(msg, tx_id, addr, requester_ip=ip)
 
         elif msg_type == MSG_STORE:
-            self._handle_store(msg)
+            self._handle_store(msg, public_ip=ip, public_port=port)
 
         elif msg_type == MSG_FIND_VALUE:
-            self._handle_find_value(msg, tx_id, addr, phone)
+            self._handle_find_value(msg, tx_id, addr, phone, requester_ip=ip)
 
         elif msg_type == MSG_CONNECT_REQ:
             self._handle_connect_request(msg, tx_id, addr, phone, ip, port)
@@ -235,111 +259,128 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         elif msg_type == MSG_RELAY:
             self._handle_relay(msg, addr, phone)
 
+    # -----------------------------------------------------------------------
+
     def _handle_ping(self, tx_id: str, addr, phone: str, ip: str, port: int):
-        """Reply with PONG + inject the peer's own public address as a STORE."""
-        # Tell the peer what their public address looks like from outside
+        """
+        Reply with PONG, telling the peer its own public address.
+
+        NAT note: `addr` is the (ip, port) tuple the OS gave us from recvfrom.
+        This is the peer's *public* address as seen from the internet — the
+        exact endpoint their router's NAT mapping points to.  We echo it back
+        in key/value so the client can learn its own public port, which it
+        cannot know until a packet comes back from outside.
+        """
         pong = make_message(MSG_PONG, transactionID=tx_id)
-        # Piggyback their public address in the value field so they can
-        # self-announce correctly
         pong["key"]   = f"public-addr-{phone}"
         pong["value"] = f"{ip}:{port}"
         self._send(pong, addr)
         log.info(f"  → PONG to {phone} ({ip}:{port})")
 
-        # Also proactively tell this peer about other live peers
-        closest = self.registry.closest(
-            node_id_from_phone(phone), k=5
-        )
-        # exclude self
+        # Proactively share a few other live peers so the new node can
+        # start building its routing table immediately.
+        closest = self.registry.closest(node_id_from_phone(phone), k=5)
         closest = [p for p in closest if p.phone != phone]
         if closest:
             found = make_message(
                 MSG_FOUND_NODE,
-                peers=[peer_to_codable(p) for p in closest]
+                peers=[peer_to_codable(p, requester_ip=ip) for p in closest]
             )
             self._send(found, addr)
             log.info(f"  → Sent {len(closest)} peers to {phone}")
 
-    def _handle_find_node(self, msg: dict, tx_id: str, addr):
+    def _handle_find_node(self, msg: dict, tx_id: str, addr, requester_ip: str = None):
         target_bytes = msg.get("targetID") or []
         target_hex   = bytes(target_bytes).hex() if target_bytes else BOOTSTRAP_ID
         closest      = self.registry.closest(target_hex)
         reply = make_message(
             MSG_FOUND_NODE,
             transactionID=tx_id,
-            peers=[peer_to_codable(p) for p in closest]
+            peers=[peer_to_codable(p, requester_ip=requester_ip) for p in closest]
         )
         self._send(reply, addr)
 
-    def _handle_store(self, msg: dict):
+    def _handle_store(self, msg: dict, public_ip: str = None, public_port: int = None):
         key   = msg.get("key")
         value = msg.get("value")
-        if key and value:
-            self.kv.put(key, value)
-            log.info(f"  STORE {key} = {value}")
+        if not (key and value):
+            return
 
-    def _handle_find_value(self, msg: dict, tx_id: str, addr, phone: str):
+        # If the client is announcing its own address ("user-<phone>"),
+        # override whatever LAN address it put in `value` with the real public
+        # address observed from the datagram.  Peers outside the NAT need this.
+        if key.startswith("user-") and public_ip:
+            corrected = f"{public_ip}:{public_port}"
+            if value != corrected:
+                log.info(f"  STORE {key}: client said {value}, "
+                         f"overriding with public addr {corrected}")
+            self.kv.put(key, corrected)
+        else:
+            self.kv.put(key, value)
+
+        log.info(f"  STORE {key} = {self.kv.get(key)}")
+
+    def _handle_find_value(self, msg: dict, tx_id: str, addr,
+                            phone: str, requester_ip: str = None):
         key = msg.get("key", "")
 
-        # Special case: look up a peer by phone number
-        # iOS stores "user-PHONE" -> "IP:PORT"
+        # Fast path: peer address lookup ("user-<phone>")
         if key.startswith("user-"):
             target_phone = key[5:]
             peer = self.registry.get(target_phone)
             if peer:
-                reply = make_message(
-                    MSG_FOUND_VALUE,
-                    transactionID=tx_id,
-                    key=key,
-                    value=f"{peer.ip}:{peer.port}"
-                )
+                requester_peer = self.registry.get(phone)
+                if requester_peer and requester_peer.ip == peer.ip:
+                    # Same NAT → use LAN address for direct local comms
+                    addr_to_return = f"{peer.lan_ip}:{peer.lan_port}"
+                    log.info(f"  → Same NAT, returning LAN addr: {addr_to_return}")
+                else:
+                    addr_to_return = f"{peer.ip}:{peer.port}"
+                reply = make_message(MSG_FOUND_VALUE, transactionID=tx_id,
+                                     key=key, value=addr_to_return)
                 self._send(reply, addr)
-                log.info(f"  FOUND_VALUE {key} = {peer.ip}:{peer.port}")
+                log.info(f"  FOUND_VALUE {key} = {addr_to_return}")
                 return
 
         # General KV lookup
         value = self.kv.get(key)
         if value:
-            reply = make_message(
-                MSG_FOUND_VALUE,
-                transactionID=tx_id,
-                key=key,
-                value=value
-            )
+            reply = make_message(MSG_FOUND_VALUE, transactionID=tx_id,
+                                 key=key, value=value)
             self._send(reply, addr)
         else:
-            # Return closest peers instead
             closest = self.registry.closest(node_id_from_phone(key))
             reply = make_message(
                 MSG_FOUND_NODE,
                 transactionID=tx_id,
-                peers=[peer_to_codable(p) for p in closest]
+                peers=[peer_to_codable(p, requester_ip=requester_ip) for p in closest]
             )
             self._send(reply, addr)
 
     def _handle_connect_request(self, msg: dict, tx_id: str, addr,
-                                 requester_phone: str, requester_ip: str, requester_port: int):
+                                 requester_phone: str, requester_ip: str,
+                                 requester_port: int):
         """
-        UDP Hole Punching coordination:
-        A wants to connect to B.
-        1. We find B's public address.
-        2. We send A → B's address.
-        3. We send B → A's address.
-        Both sides then send UDP simultaneously, punching through NAT.
+        UDP Hole Punching coordination.
+        A wants to connect to B:
+          1. Look up B's public address in the registry.
+          2. Send HOLE_PUNCH to A with B's public address.
+          3. Send HOLE_PUNCH to B with A's public address.
+        Both sides fire UDP simultaneously, opening the NAT mappings.
         """
         target_phone = msg.get("key", "")
         target_peer  = self.registry.get(target_phone)
 
         if not target_peer:
             log.info(f"  Hole punch: {target_phone} not found in registry")
-            # Decline — target not online
             decline = make_message(MSG_CONNECT_DECLINE, transactionID=tx_id)
             self._send(decline, addr)
             return
 
-        log.info(f"  Hole punch: {requester_phone} <-> {target_phone}")
+        log.info(f"  Hole punch: {requester_phone} ({requester_ip}:{requester_port})"
+                 f" <-> {target_phone} ({target_peer.ip}:{target_peer.port})")
 
-        # Tell requester (A) about target (B)'s public address
+        # Tell requester (A) where target (B) is
         notify_a = make_message(
             MSG_HOLE_PUNCH,
             transactionID=tx_id,
@@ -348,7 +389,7 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         )
         self._send(notify_a, addr)
 
-        # Tell target (B) about requester (A)'s public address
+        # Tell target (B) where requester (A) is
         notify_b = make_message(
             MSG_HOLE_PUNCH,
             transactionID=tx_id,
@@ -357,25 +398,17 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         )
         self._send(notify_b, (target_peer.ip, target_peer.port))
 
-        log.info(f"  Hole punch coords sent to both sides")
+        log.info(f"  Hole punch coords sent to both sides ✓")
 
     def _handle_relay(self, msg: dict, sender_addr, sender_phone: str):
         """
         TURN-style relay fallback for symmetric NAT.
 
-        The sender wraps its real payload inside a RELAY message:
-          key   = destination phone number
-          value = JSON-encoded inner KadMessage (the actual payload)
-
-        Bootstrap unwraps it and forwards to the destination's last known
-        public address, rewriting senderIP/senderPort so the receiver can
-        reply back through the relay too.
-
         Flow:
           A  --RELAY(key=B, value=innerMsg)--> bootstrap
-          bootstrap --RELAY(key=A, value=innerMsg, from A's public addr)--> B
+          bootstrap --RELAY(key=A, value=innerMsg, from A's addr)--> B
           B  --RELAY(key=A, value=replyMsg)--> bootstrap
-          bootstrap --RELAY(key=B, value=replyMsg, from B's public addr)--> A
+          bootstrap --RELAY(key=B, value=replyMsg, from B's addr)--> A
         """
         target_phone = msg.get("key", "")
         inner_json   = msg.get("value", "")
@@ -387,30 +420,25 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
         target_peer = self.registry.get(target_phone)
         if not target_peer:
             log.info(f"  RELAY: {target_phone} not in registry, dropping")
-            # Optionally tell sender the target is offline
             decline = make_message(MSG_CONNECT_DECLINE,
-                                   key=target_phone,
-                                   value="offline")
+                                   key=target_phone, value="offline")
             self._send(decline, sender_addr)
             return
 
-        # Validate inner payload is JSON we can decode (don't forward garbage)
         try:
             inner_msg = json.loads(inner_json)
         except Exception:
             log.warning(f"  RELAY from {sender_phone}: inner payload not valid JSON")
             return
 
-        # Stamp the sender's real public address so the receiver knows who
-        # sent it and can reply via relay using the correct source.
+        # Stamp the sender's real public address so the receiver can reply.
         inner_msg["senderIP"]   = sender_addr[0]
         inner_msg["senderPort"] = sender_addr[1]
 
-        # Wrap in a new RELAY envelope addressed to the target
         forward = make_message(
             MSG_RELAY,
-            key=sender_phone,               # so receiver knows who to reply to
-            value=json.dumps(inner_msg),    # re-serialised inner message
+            key=sender_phone,
+            value=json.dumps(inner_msg),
         )
         self._send(forward, (target_peer.ip, target_peer.port))
 
@@ -430,11 +458,11 @@ class BootstrapProtocol(asyncio.DatagramProtocol):
     @staticmethod
     def _type_name(t: int) -> str:
         names = {
-            0x01: "PING", 0x02: "PONG", 0x03: "FIND_NODE",
-            0x04: "FOUND_NODE", 0x05: "STORE", 0x06: "FIND_VALUE",
-            0x07: "FOUND_VALUE", 0x08: "CONNECT_REQ", 0x09: "CONNECT_ACCEPT",
-            0x0A: "CONNECT_DECLINE", 0x0B: "CHAT", 0x0C: "CHAT_ACK",
-            0x0D: "HOLE_PUNCH", 0x0E: "RELAY",
+            0x01: "PING",        0x02: "PONG",          0x03: "FIND_NODE",
+            0x04: "FOUND_NODE",  0x05: "STORE",         0x06: "FIND_VALUE",
+            0x07: "FOUND_VALUE", 0x08: "CONNECT_REQ",   0x09: "CONNECT_ACCEPT",
+            0x0A: "CONNECT_DECLINE", 0x0B: "CHAT",      0x0C: "CHAT_ACK",
+            0x0D: "HOLE_PUNCH",  0x0E: "RELAY",
         }
         return names.get(t, f"UNKNOWN(0x{t:02X})")
 
@@ -467,7 +495,7 @@ async def main():
     )
 
     log.info(f"HopChat bootstrap server started on UDP port {PORT}")
-    log.info(f"Bootstrap node ID: {BOOTSTRAP_ID}")
+    log.info(f"Bootstrap node ID (SHA-256): {BOOTSTRAP_ID}")
 
     try:
         await maintenance(protocol_instance.registry, protocol_instance.kv)
