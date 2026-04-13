@@ -4,7 +4,7 @@ HopChat Bootstrap Server
 ========================
 A lightweight Kademlia bootstrap node + UDP hole punching coordinator.
 
-Listens on UDP port 4001 by default.
+Listens on UDP port 443 by default.
 All messages use the same JSON format as the iOS app.
 
 libp2p update: NodeIDs are now SHA-256 (32 bytes / 256 bits) to match
@@ -29,7 +29,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("hopchat-bootstrap")
 
-PORT = int(os.environ.get("HOPCHAT_PORT", 4001))
+PORT = int(os.environ.get("HOPCHAT_PORT", 443))
 
 # Message type constants (must match iOS KadMessageType)
 MSG_PING           = 0x01
