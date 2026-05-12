@@ -48,6 +48,9 @@ MSG_CHAT            = 0x0B
 MSG_CHAT_ACK        = 0x0C
 MSG_HOLE_PUNCH      = 0x0D
 MSG_RELAY           = 0x0E
+MSG_OFFLINE_NOTIFY  = 0x0F   # client → bootstrap: couldn't reach {key} phone
+MSG_CAME_ONLINE     = 0x10   # client → bootstrap: I'm back, flush my log
+MSG_PEER_ONLINE     = 0x11   # bootstrap → client: peer {key} is now at {value}
 
 K = 20
 
@@ -206,9 +209,11 @@ def peer_to_codable(p: PeerInfo, requester_ip: str = None) -> dict:
 
 class BootstrapServer:
     def __init__(self):
-        self.registry = PeerRegistry(ttl=300)
-        self.kv       = KVStore(ttl=600)
+        self.registry     = PeerRegistry(ttl=300)
+        self.kv           = KVStore(ttl=600)
         self._relay_count = 0
+        # offline_log[target_phone] = list of {"phone": str, "ip": str, "port": int}
+        self._offline_log: Dict[str, list] = {}
 
     async def handle_client(self,
                              reader: asyncio.StreamReader,
@@ -292,6 +297,14 @@ class BootstrapServer:
 
         elif msg_type == MSG_RELAY:
             await self._handle_relay(msg, phone, ip, port)
+            return None
+
+        elif msg_type == MSG_OFFLINE_NOTIFY:
+            self._handle_offline_notify(msg, phone, ip, port)
+            return None
+
+        elif msg_type == MSG_CAME_ONLINE:
+            await self._handle_came_online(phone, ip, port)
             return None
 
         return None
@@ -442,6 +455,29 @@ class BootstrapServer:
         self._relay_count += 1
         log.debug(f"  RELAY {sender_phone} -> {target_phone}")
 
+    def _handle_offline_notify(self, msg: dict,
+                                sender_phone: str, sender_ip: str, sender_port: int):
+        target_phone = msg.get("key", "")
+        if not target_phone:
+            return
+        waiters = self._offline_log.setdefault(target_phone, [])
+        if not any(w["phone"] == sender_phone for w in waiters):
+            waiters.append({"phone": sender_phone, "ip": sender_ip, "port": sender_port})
+            log.info(f"  OFFLINE_NOTIFY: {sender_phone} waiting for {target_phone} "
+                     f"({len(waiters)} waiter(s))")
+
+    async def _handle_came_online(self, phone: str, ip: str, port: int):
+        waiters = self._offline_log.pop(phone, [])
+        if not waiters:
+            return
+        # Use registry address (public IP bootstrap observed) as the canonical address.
+        peer = self.registry.get(phone)
+        address = f"{peer.ip}:{peer.port}" if peer else f"{ip}:{port}"
+        log.info(f"  CAME_ONLINE: {phone} at {address}, notifying {len(waiters)} waiter(s)")
+        for waiter in waiters:
+            notify = make_message(MSG_PEER_ONLINE, key=phone, value=address)
+            asyncio.create_task(self._send_to(notify, waiter["ip"], waiter["port"]))
+
     async def _send_to(self, msg: dict, ip: str, port: int):
         """Open an outbound TCP connection and send a single framed message."""
         try:
@@ -468,6 +504,7 @@ def _type_name(t: int) -> str:
         0x07: "FOUND_VALUE", 0x08: "CONNECT_REQ",   0x09: "CONNECT_ACCEPT",
         0x0A: "CONNECT_DECLINE", 0x0B: "CHAT",      0x0C: "CHAT_ACK",
         0x0D: "HOLE_PUNCH",  0x0E: "RELAY",
+        0x0F: "OFFLINE_NOTIFY", 0x10: "CAME_ONLINE", 0x11: "PEER_ONLINE",
     }
     return names.get(t, f"UNKNOWN(0x{t:02X})")
 
