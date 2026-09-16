@@ -274,10 +274,14 @@ def normalize_phone(raw: str, default_region: Optional[str] = None) -> Optional[
         if not code:
             return None
         national = s
-        # Drop a single national trunk '0'.
-        if national.startswith("0"):
-            national = national[1:]
-        candidate = "+" + code + national
+        # Drop a single national trunk '0' (Italy keeps it).
+        if region != "IT" and national.startswith("0"):
+            candidate = "+" + code + national[1:]
+        elif national.startswith(code) and len(national) - len(code) >= 8:
+            # Country code typed without '+': don't prefix it twice.
+            candidate = "+" + national
+        else:
+            candidate = "+" + code + national
 
     return candidate if is_valid_e164(candidate) else None
 
