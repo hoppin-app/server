@@ -1,1 +1,12 @@
-uvloop>=0.19.0
+# HopChat bootstrap server dependencies.
+#
+# Install:  ./venv/bin/pip install -r requirements.txt
+#
+# Only `cryptography` is required. Everything else the server needs (asyncio,
+# ssl, hmac, secrets, urllib for Twilio) is in the Python standard library.
+
+cryptography>=45.0,<51.0
+
+# Optional: uvloop gives a faster event loop. bootstrap.py uses it only if it
+# imports successfully, so this line may be removed or left uninstalled.
+uvloop>=0.19.0; sys_platform != "win32"

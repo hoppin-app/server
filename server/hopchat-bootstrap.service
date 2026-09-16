@@ -1,0 +1,68 @@
+# systemd unit for the HopChat bootstrap server.
+#
+# Install:
+#   sudo useradd --system --home /opt/hopchat --shell /usr/sbin/nologin hopchat
+#   sudo mkdir -p /opt/hopchat /var/lib/hopchat
+#   sudo chown -R hopchat:hopchat /opt/hopchat /var/lib/hopchat
+#   sudo chmod 700 /var/lib/hopchat
+#   # copy bootstrap.py + requirements.txt to /opt/hopchat, create the venv:
+#   sudo -u hopchat python3 -m venv /opt/hopchat/venv
+#   sudo -u hopchat /opt/hopchat/venv/bin/pip install -r /opt/hopchat/requirements.txt
+#   sudo cp server/hopchat-bootstrap.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hopchat-bootstrap
+#
+# Secrets (TWILIO_AUTH_TOKEN etc.) go in /etc/hopchat/bootstrap.env, mode 600,
+# owned by root, NOT in this unit file.
+
+[Unit]
+Description=HopChat bootstrap server (certificate authority + encrypted relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hopchat
+Group=hopchat
+WorkingDirectory=/var/lib/hopchat
+
+Environment=HOPCHAT_ENV=prod
+Environment=HOPCHAT_TLS_PORT=4443
+Environment=HOPCHAT_TLS_CERT=/etc/hopchat/tls/cert.pem
+Environment=HOPCHAT_TLS_KEY=/etc/hopchat/tls/key.pem
+Environment=HOPCHAT_IDENTITY_KEY=/var/lib/hopchat/bootstrap_identity.key
+Environment=HOPCHAT_STATE=/var/lib/hopchat/bootstrap_state.json
+Environment=HOPCHAT_REPORTS=/var/lib/hopchat/reports.jsonl
+# TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM live here:
+EnvironmentFile=/etc/hopchat/bootstrap.env
+
+ExecStart=/opt/hopchat/venv/bin/python /opt/hopchat/bootstrap.py
+
+# SIGTERM makes the server flush its state file before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=5
+
+# Binding 4443 needs no privilege, but keep this if you move to 443.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/hopchat
+ReadOnlyPaths=/etc/hopchat
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
