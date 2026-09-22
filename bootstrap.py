@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HopChat bootstrap server (v2).
+hoppin bootstrap server (v2).
 
 Implements docs/DESIGN_CONTRACT.md sections 1-5:
 
@@ -51,20 +51,20 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-ENV = os.environ.get("HOPCHAT_ENV", "prod").strip().lower()
+ENV = os.environ.get("HOPPIN_ENV", "prod").strip().lower()
 IS_DEV = ENV == "dev"
 
-PLAINTEXT_PORT = int(os.environ.get("HOPCHAT_PORT", "4001"))
-TLS_PORT = int(os.environ.get("HOPCHAT_TLS_PORT", "4443"))
-TLS_CERT = os.environ.get("HOPCHAT_TLS_CERT", "").strip()
-TLS_KEY = os.environ.get("HOPCHAT_TLS_KEY", "").strip()
-ALLOW_PLAINTEXT = os.environ.get("HOPCHAT_ALLOW_PLAINTEXT", "") == "1"
+PLAINTEXT_PORT = int(os.environ.get("HOPPIN_PORT", "4001"))
+TLS_PORT = int(os.environ.get("HOPPIN_TLS_PORT", "4443"))
+TLS_CERT = os.environ.get("HOPPIN_TLS_CERT", "").strip()
+TLS_KEY = os.environ.get("HOPPIN_TLS_KEY", "").strip()
+ALLOW_PLAINTEXT = os.environ.get("HOPPIN_ALLOW_PLAINTEXT", "") == "1"
 
-IDENTITY_KEY_PATH = os.environ.get("HOPCHAT_IDENTITY_KEY", "./bootstrap_identity.key")
-STATE_PATH = os.environ.get("HOPCHAT_STATE", "./bootstrap_state.json")
-REPORTS_PATH = os.environ.get("HOPCHAT_REPORTS", "./reports.jsonl")
+IDENTITY_KEY_PATH = os.environ.get("HOPPIN_IDENTITY_KEY", "./bootstrap_identity.key")
+STATE_PATH = os.environ.get("HOPPIN_STATE", "./bootstrap_state.json")
+REPORTS_PATH = os.environ.get("HOPPIN_REPORTS", "./reports.jsonl")
 
-BIND_HOST = os.environ.get("HOPCHAT_BIND", "0.0.0.0")
+BIND_HOST = os.environ.get("HOPPIN_BIND", "0.0.0.0")
 
 # --- protocol constants (§3) ---------------------------------------------- #
 
@@ -100,7 +100,7 @@ QUEUE_MAX_ENVELOPES = 500            # per recipient
 QUEUE_MAX_BYTES = 20 * 1024 * 1024   # per recipient
 ENVELOPE_MAX_BYTES = 900 * 1024
 QUEUE_TTL = 7 * 86400
-GLOBAL_QUEUE_MAX_BYTES = int(os.environ.get("HOPCHAT_QUEUE_MAX_BYTES", str(512 * 1024 * 1024)))
+GLOBAL_QUEUE_MAX_BYTES = int(os.environ.get("HOPPIN_QUEUE_MAX_BYTES", str(512 * 1024 * 1024)))
 RELAY_BATCH_BUDGET = 880 * 1024      # keep the response frame under 900 KB
 RELAY_WAIT_MAX = 25
 RELAY_MAX_MAX = 100
@@ -153,7 +153,7 @@ SERVER_TYPES = {
 # Types that do not carry a certificate (§3).
 UNAUTHENTICATED_TYPES = {T_VERIFY_START, T_VERIFY_CONFIRM}
 
-log = logging.getLogger("hopchat-bootstrap")
+log = logging.getLogger("hoppin-bootstrap")
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ def mask_phone(phone: str) -> str:
 def cert_signed_fields(phone: str, signing_key: str, agreement_key: str,
                        issued_at: int, expires_at: int, serial: str) -> List[str]:
     return [
-        "hopchat-cert-v1",
+        "hoppin-cert-v1",
         phone,
         signing_key,
         agreement_key,
@@ -396,7 +396,7 @@ ENVELOPE_FIELDS = ("id", "senderPhone", "recipientPhone", "timestamp",
 
 def envelope_header(env: Dict[str, Any]) -> List[str]:
     return [
-        "hopchat-env-v2",
+        "hoppin-env-v2",
         env["id"],
         env["senderPhone"],
         env["recipientPhone"],
@@ -438,7 +438,7 @@ def wire_signed_fields(msg: Dict[str, Any]) -> List[str]:
     env = msg.get("envelope")
     digest = envelope_digest_hex(env) if isinstance(env, dict) and validate_envelope_shape(env) else ""
     return [
-        "hopchat-wire-v2",
+        "hoppin-wire-v2",
         cint(msg["type"]),
         msg["txID"],
         msg["senderPhone"],
@@ -579,7 +579,7 @@ class TwilioSMSProvider(SMSProvider):
         body = urllib.parse.urlencode({
             "To": phone,
             "From": self.from_number,
-            "Body": "Your HopChat verification code is %s. It expires in 10 minutes." % code,
+            "Body": "Your hoppin verification code is %s. It expires in 10 minutes." % code,
         }).encode("ascii")
         auth = base64.b64encode(
             ("%s:%s" % (self.account_sid, self.auth_token)).encode("utf-8")
@@ -610,7 +610,7 @@ def build_sms_provider() -> SMSProvider:
         return ConsoleSMSProvider()
     raise SystemExit(
         "refusing to start: no SMS provider configured. Set TWILIO_ACCOUNT_SID, "
-        "TWILIO_AUTH_TOKEN and TWILIO_FROM, or run with HOPCHAT_ENV=dev."
+        "TWILIO_AUTH_TOKEN and TWILIO_FROM, or run with HOPPIN_ENV=dev."
     )
 
 
@@ -1437,8 +1437,8 @@ class BootstrapServer:
 
         if not started_any:
             raise SystemExit(
-                "no listener configured: set HOPCHAT_TLS_CERT and HOPCHAT_TLS_KEY, "
-                "or HOPCHAT_ALLOW_PLAINTEXT=1 for development."
+                "no listener configured: set HOPPIN_TLS_CERT and HOPPIN_TLS_KEY, "
+                "or HOPPIN_ALLOW_PLAINTEXT=1 for development."
             )
 
         self._tasks.append(asyncio.ensure_future(self._housekeeping()))
@@ -1485,7 +1485,7 @@ class BootstrapServer:
 
 async def _amain() -> None:
     server = BootstrapServer(
-        dev_fixed_code=os.environ.get("HOPCHAT_DEV_FIXED_CODE") or None,
+        dev_fixed_code=os.environ.get("HOPPIN_DEV_FIXED_CODE") or None,
     )
     await server.start(tls_cert=TLS_CERT, tls_key=TLS_KEY)
 

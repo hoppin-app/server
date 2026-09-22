@@ -1,4 +1,4 @@
-# HopChat bootstrap server
+# hoppin bootstrap server
 
 `bootstrap.py` is the only server component. It does two jobs:
 
@@ -33,18 +33,18 @@ certificate, a valid wire signature, a fresh timestamp and an unseen `txID`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HOPCHAT_ENV` | `prod` | `dev` unlocks `ConsoleSMSProvider` and `HOPCHAT_DEV_FIXED_CODE` |
-| `HOPCHAT_TLS_PORT` | `4443` | TLS listener port |
-| `HOPCHAT_TLS_CERT` | – | PEM certificate chain; TLS starts only when cert **and** key are set |
-| `HOPCHAT_TLS_KEY` | – | PEM private key |
-| `HOPCHAT_PORT` | `4001` | Plaintext listener port |
-| `HOPCHAT_ALLOW_PLAINTEXT` | – | `1` enables the plaintext listener (**development only**) |
-| `HOPCHAT_BIND` | `0.0.0.0` | Bind address |
-| `HOPCHAT_IDENTITY_KEY` | `./bootstrap_identity.key` | Server Ed25519 seed; created on first run, mode 600 |
-| `HOPCHAT_STATE` | `./bootstrap_state.json` | Certificates + revoked serials + queued mail, mode 600 |
-| `HOPCHAT_REPORTS` | `./reports.jsonl` | Abuse reports, one JSON object per line, mode 600 |
-| `HOPCHAT_QUEUE_MAX_BYTES` | `536870912` | Global relay memory cap before oldest-first eviction |
-| `HOPCHAT_DEV_FIXED_CODE` | – | Fixed OTP; **ignored unless `HOPCHAT_ENV=dev`** |
+| `HOPPIN_ENV` | `prod` | `dev` unlocks `ConsoleSMSProvider` and `HOPPIN_DEV_FIXED_CODE` |
+| `HOPPIN_TLS_PORT` | `4443` | TLS listener port |
+| `HOPPIN_TLS_CERT` | – | PEM certificate chain; TLS starts only when cert **and** key are set |
+| `HOPPIN_TLS_KEY` | – | PEM private key |
+| `HOPPIN_PORT` | `4001` | Plaintext listener port |
+| `HOPPIN_ALLOW_PLAINTEXT` | – | `1` enables the plaintext listener (**development only**) |
+| `HOPPIN_BIND` | `0.0.0.0` | Bind address |
+| `HOPPIN_IDENTITY_KEY` | `./bootstrap_identity.key` | Server Ed25519 seed; created on first run, mode 600 |
+| `HOPPIN_STATE` | `./bootstrap_state.json` | Certificates + revoked serials + queued mail, mode 600 |
+| `HOPPIN_REPORTS` | `./reports.jsonl` | Abuse reports, one JSON object per line, mode 600 |
+| `HOPPIN_QUEUE_MAX_BYTES` | `536870912` | Global relay memory cap before oldest-first eviction |
+| `HOPPIN_DEV_FIXED_CODE` | – | Fixed OTP; **ignored unless `HOPPIN_ENV=dev`** |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` | – | Enables `TwilioSMSProvider` |
 
 The server **refuses to start** if no listener is configured, and in `prod`
@@ -58,9 +58,9 @@ back to logging codes to the console.
 ### Development
 
 ```sh
-export HOPCHAT_ENV=dev
-export HOPCHAT_ALLOW_PLAINTEXT=1
-export HOPCHAT_DEV_FIXED_CODE=123456
+export HOPPIN_ENV=dev
+export HOPPIN_ALLOW_PLAINTEXT=1
+export HOPPIN_DEV_FIXED_CODE=123456
 ./venv/bin/python bootstrap.py
 ```
 
@@ -79,12 +79,12 @@ Smoke test it with the bundled client:
 
 ### Production
 
-TLS only — never set `HOPCHAT_ALLOW_PLAINTEXT` on a public host.
+TLS only — never set `HOPPIN_ALLOW_PLAINTEXT` on a public host.
 
 ```sh
-export HOPCHAT_ENV=prod
-export HOPCHAT_TLS_CERT=/etc/hopchat/tls/cert.pem
-export HOPCHAT_TLS_KEY=/etc/hopchat/tls/key.pem
+export HOPPIN_ENV=prod
+export HOPPIN_TLS_CERT=/etc/hoppin/tls/cert.pem
+export HOPPIN_TLS_KEY=/etc/hoppin/tls/key.pem
 export TWILIO_ACCOUNT_SID=AC... TWILIO_AUTH_TOKEN=... TWILIO_FROM='+1...'
 ./venv/bin/python bootstrap.py
 ```
@@ -94,7 +94,7 @@ export TWILIO_ACCOUNT_SID=AC... TWILIO_AUTH_TOKEN=... TWILIO_FROM='+1...'
 ## TLS and the SPKI pin
 
 ```sh
-./server/gen_tls_cert.sh hopchat.example.com ./tls 825
+./server/gen_tls_cert.sh hoppin.example.com ./tls 825
 ```
 
 This writes `cert.pem` + `key.pem` (mode 600) and prints the pin. To extract the
@@ -117,7 +117,7 @@ both, and you can rotate without an app update.
 
 1. Buy an SMS-capable number in the Twilio console.
 2. Copy the Account SID and Auth Token from the project dashboard.
-3. Put them in `/etc/hopchat/bootstrap.env` (mode 600, owned by root):
+3. Put them in `/etc/hoppin/bootstrap.env` (mode 600, owned by root):
 
    ```
    TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -132,10 +132,10 @@ an HTTP status — never the code, never the full number.
 
 ## Deploying
 
-See [`hopchat-bootstrap.service`](hopchat-bootstrap.service) for a hardened
+See [`hoppin-bootstrap.service`](hoppin-bootstrap.service) for a hardened
 systemd unit; its header comments contain the full install sequence. Key points:
 
-* Run as a dedicated unprivileged user with state in `/var/lib/hopchat` (mode 700).
+* Run as a dedicated unprivileged user with state in `/var/lib/hoppin` (mode 700).
 * Stop with `SIGTERM` — the server flushes its state file before exiting, so
   queued mail survives a restart. State is also flushed every 10 s.
 * Back up `bootstrap_identity.key`. **If you lose it, every installed app that
@@ -150,7 +150,7 @@ In `HopChat-1/App/AppConfig.swift`:
 
 ```swift
 enum AppConfig {
-    static let serverHost = "hopchat.example.com"
+    static let serverHost = "hoppin.example.com"
     static let serverTLSPort: UInt16 = 4443
 
     // The line bootstrap.py prints at startup.
@@ -191,5 +191,5 @@ envelope sealing or safety-number algorithm changes, and tell the app side.
   per phone per hour and 10 per IP, 30 certificate lookups per caller per hour.
 * **Relay queue**: ≤ 500 envelopes and ≤ 20 MB per recipient, ≤ 900 KB per
   envelope, 7-day TTL, deduplicated by envelope id.
-* **Abuse reports** land in `HOPCHAT_REPORTS` as JSON lines and contain
+* **Abuse reports** land in `HOPPIN_REPORTS` as JSON lines and contain
   user-consented plaintext evidence — treat that file as sensitive.

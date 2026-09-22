@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # gen_tls_cert.sh — generate a self-signed P-256 TLS certificate for the
-# HopChat bootstrap server, and print the SPKI pin the iOS app must pin.
+# hoppin bootstrap server, and print the SPKI pin the iOS app must pin.
 #
 # Usage:
 #   ./server/gen_tls_cert.sh [COMMON_NAME] [OUT_DIR] [DAYS]
@@ -11,8 +11,8 @@
 #   DAYS         validity in days (default: 825, the max Apple accepts)
 #
 # Outputs:
-#   $OUT_DIR/cert.pem   certificate  (HOPCHAT_TLS_CERT)
-#   $OUT_DIR/key.pem    private key  (HOPCHAT_TLS_KEY, mode 600)
+#   $OUT_DIR/cert.pem   certificate  (HOPPIN_TLS_CERT)
+#   $OUT_DIR/key.pem    private key  (HOPPIN_TLS_KEY, mode 600)
 #   the base64 SHA-256 of the SubjectPublicKeyInfo DER -> AppConfig.serverSPKISHA256Base64
 #
 # NOTE: the pin is over the SubjectPublicKeyInfo, not the certificate. Re-issuing
@@ -85,7 +85,7 @@ cat <<EOF
 
   Run the server with:
 
-      export HOPCHAT_TLS_CERT="$(cd "$(dirname "$CERT")" && pwd)/$(basename "$CERT")"
-      export HOPCHAT_TLS_KEY="$(cd "$(dirname "$KEY")" && pwd)/$(basename "$KEY")"
+      export HOPPIN_TLS_CERT="$(cd "$(dirname "$CERT")" && pwd)/$(basename "$CERT")"
+      export HOPPIN_TLS_KEY="$(cd "$(dirname "$KEY")" && pwd)/$(basename "$KEY")"
 
 EOF

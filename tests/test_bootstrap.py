@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for the HopChat bootstrap server.
+Tests for the hoppin bootstrap server.
 
 Run:  ./venv/bin/python -m unittest discover -s server -v
 
@@ -33,12 +33,12 @@ for path in (_ROOT, _HERE):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-# The server reads HOPCHAT_ENV at import time.
-os.environ.setdefault("HOPCHAT_ENV", "dev")
+# The server reads HOPPIN_ENV at import time.
+os.environ.setdefault("HOPPIN_ENV", "dev")
 
 import bootstrap as bs  # noqa: E402
 from client import (  # noqa: E402
-    HopChatClient,
+    hoppinClient,
     ServerError,
     open_envelope,
     raw_public,
@@ -114,7 +114,7 @@ class ServerTestCase(unittest.TestCase):
     """Base class: a plaintext dev server on an ephemeral port per test."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="hopchat-test-")
+        self.tmp = tempfile.mkdtemp(prefix="hoppin-test-")
         self.state_path = os.path.join(self.tmp, "state.json")
         self.reports_path = os.path.join(self.tmp, "reports.jsonl")
         self.identity = Ed25519PrivateKey.generate()
@@ -153,7 +153,7 @@ class ServerTestCase(unittest.TestCase):
             self.server = None
 
     def client(self, phone, port=None, **kwargs):
-        return HopChatClient(
+        return hoppinClient(
             phone,
             host="127.0.0.1",
             port=port if port is not None else self.server.plaintext_port,
@@ -1002,7 +1002,7 @@ class TransportTests(ServerTestCase):
         await self.start_server(tls_port=0, tls_cert=cert_path, tls_key=key_path)
         self.assertIsNotNone(self.server.tls_port)
 
-        alice = HopChatClient(ALICE, host="127.0.0.1", port=self.server.tls_port,
+        alice = hoppinClient(ALICE, host="127.0.0.1", port=self.server.tls_port,
                               use_tls=True, cafile=cert_path,
                               server_key_b64=self.server.public_b64,
                               server_hostname="localhost")

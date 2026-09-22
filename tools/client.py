@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Minimal async HopChat client.
+Minimal async hoppin client.
 
 Used by server/test_bootstrap.py, and usable by hand for smoke testing a
 deployment. It implements the client half of §1-§4 of the design contract:
 canonical encoding, certificate handling, wire signing, and envelope sealing.
 
-Manual smoke test (server running in dev with HOPCHAT_ALLOW_PLAINTEXT=1):
+Manual smoke test (server running in dev with HOPPIN_ALLOW_PLAINTEXT=1):
 
     ./venv/bin/python -m server.client --host 127.0.0.1 --port 4001 \
         --phone +351912345678 --code 123456
@@ -68,12 +68,12 @@ def raw_private(key) -> bytes:
 
 def derive_envelope_key(dh1: bytes, dh2: bytes, sender_signing_b64: str,
                         recipient_signing_b64: str, header: List[str]) -> bytes:
-    info = bs.canonical(["hopchat-seal-v2", sender_signing_b64,
+    info = bs.canonical(["hoppin-seal-v2", sender_signing_b64,
                          recipient_signing_b64] + header)
     return HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=b"HopChat-E2E-v2",
+        salt=b"hoppin-E2E-v2",
         info=info,
     ).derive(dh1 + dh2)
 
@@ -104,7 +104,7 @@ def seal_envelope(payload: bytes,
         base64.b64decode(recipient_agreement_b64))
 
     header = [
-        "hopchat-env-v2",
+        "hoppin-env-v2",
         envelope_id,
         sender_phone,
         recipient_phone,
@@ -175,7 +175,7 @@ class ServerError(Exception):
         self.message = message
 
 
-class HopChatClient:
+class hoppinClient:
     def __init__(self, phone: str, host: str = "127.0.0.1", port: int = 4001,
                  use_tls: bool = False, cafile: Optional[str] = None,
                  server_key_b64: Optional[str] = None,
@@ -388,7 +388,7 @@ class HopChatClient:
 # ---------------------------------------------------------------------------
 
 async def _smoke(args: argparse.Namespace) -> None:
-    client = HopChatClient(args.phone, host=args.host, port=args.port,
+    client = hoppinClient(args.phone, host=args.host, port=args.port,
                            use_tls=args.tls, cafile=args.cafile,
                            server_key_b64=args.server_key)
     retry = await client.verify_start()
@@ -404,7 +404,7 @@ async def _smoke(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HopChat bootstrap smoke client")
+    parser = argparse.ArgumentParser(description="hoppin bootstrap smoke client")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4001)
     parser.add_argument("--phone", required=True)
