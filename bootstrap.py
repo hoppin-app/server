@@ -66,6 +66,20 @@ REPORTS_PATH = os.environ.get("HOPPIN_REPORTS", "./reports.jsonl")
 
 BIND_HOST = os.environ.get("HOPPIN_BIND", "0.0.0.0")
 
+
+def bind_hosts(value: str):
+    """Addresses to listen on, from HOPPIN_BIND.
+
+    "*", "all" or an empty value mean *both* families — which is what a server
+    reachable over IPv6 needs. The default "0.0.0.0" is IPv4 only: a phone on
+    an IPv6-only mobile network cannot reach it, and the failure looks exactly
+    like a firewall, so it is worth being explicit about.
+    """
+    value = (value or "").strip()
+    if value in ("", "*", "all", "::,0.0.0.0", "0.0.0.0,::"):
+        return ["0.0.0.0", "::"]
+    return value
+
 # --- protocol constants (§3) ---------------------------------------------- #
 
 WIRE_VERSION = 2
@@ -1420,7 +1434,8 @@ class BootstrapServer:
             except (AttributeError, ValueError):
                 pass
             port = TLS_PORT if tls_port is None else tls_port
-            srv = await asyncio.start_server(self.handle_connection, BIND_HOST, port, ssl=ctx)
+            srv = await asyncio.start_server(self.handle_connection,
+                                             bind_hosts(BIND_HOST), port, ssl=ctx)
             self._servers.append(srv)
             self.tls_port = srv.sockets[0].getsockname()[1]
             log.info("TLS listener on %s:%d", BIND_HOST, self.tls_port)
@@ -1428,7 +1443,8 @@ class BootstrapServer:
 
         if allow_plaintext:
             port = PLAINTEXT_PORT if plaintext_port is None else plaintext_port
-            srv = await asyncio.start_server(self.handle_connection, BIND_HOST, port)
+            srv = await asyncio.start_server(self.handle_connection,
+                                             bind_hosts(BIND_HOST), port)
             self._servers.append(srv)
             self.plaintext_port = srv.sockets[0].getsockname()[1]
             log.warning("PLAINTEXT listener on %s:%d - development only",

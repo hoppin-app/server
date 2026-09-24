@@ -39,7 +39,7 @@ certificate, a valid wire signature, a fresh timestamp and an unseen `txID`.
 | `HOPPIN_TLS_KEY` | – | PEM private key |
 | `HOPPIN_PORT` | `4001` | Plaintext listener port |
 | `HOPPIN_ALLOW_PLAINTEXT` | – | `1` enables the plaintext listener (**development only**) |
-| `HOPPIN_BIND` | `0.0.0.0` | Bind address |
+| `HOPPIN_BIND` | `0.0.0.0` | Listen address. **`*` (or empty) listens on IPv4 *and* IPv6** — needed for clients on IPv6-only mobile networks; the default is IPv4 only |
 | `HOPPIN_IDENTITY_KEY` | `./bootstrap_identity.key` | Server Ed25519 seed; created on first run, mode 600 |
 | `HOPPIN_STATE` | `./bootstrap_state.json` | Certificates + revoked serials + queued mail, mode 600 |
 | `HOPPIN_REPORTS` | `./reports.jsonl` | Abuse reports, one JSON object per line, mode 600 |

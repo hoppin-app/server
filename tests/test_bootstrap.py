@@ -1331,5 +1331,25 @@ class LoggingTests(ServerTestCase):
         self.assertIn(bs.mask_phone(ALICE), blob)
 
 
+
+class BindHostsTests(unittest.TestCase):
+    """Which addresses the server listens on.
+
+    The default is IPv4 only, which silently makes the server unreachable from
+    an IPv6-only mobile network — a failure that looks like a firewall and
+    costs an afternoon. "*" (or an empty value) listens on both.
+    """
+
+    def test_wildcard_means_both_families(self):
+        for value in ("", "   ", "*", "all"):
+            self.assertEqual(bs.bind_hosts(value), ["0.0.0.0", "::"], value)
+
+    def test_an_explicit_address_is_left_alone(self):
+        self.assertEqual(bs.bind_hosts("0.0.0.0"), "0.0.0.0")
+        self.assertEqual(bs.bind_hosts("::"), "::")
+        self.assertEqual(bs.bind_hosts("127.0.0.1"), "127.0.0.1")
+        self.assertEqual(bs.bind_hosts(" 10.0.0.5 "), "10.0.0.5")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
