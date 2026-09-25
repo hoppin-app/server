@@ -37,6 +37,7 @@ for path in (_ROOT, _HERE):
 os.environ.setdefault("HOPPIN_ENV", "dev")
 
 import bootstrap as bs  # noqa: E402
+import apns as bsapns  # noqa: E402
 from client import (  # noqa: E402
     hoppinClient,
     ServerError,
@@ -45,6 +46,8 @@ from client import (  # noqa: E402
     seal_envelope,
 )
 
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import ec  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey  # noqa: E402
 
@@ -1372,6 +1375,229 @@ class TwilioChannelTests(unittest.TestCase):
         p = bs.TwilioSMSProvider("AC1", "tok", "whatsapp:+14155238886")
         self.assertEqual(p.channel, "whatsapp")
         self.assertEqual(p._to_field("+351911111111"), "whatsapp:+351911111111")
+
+
+TOKEN_A = "a1b2c3d4" * 8
+TOKEN_B = "0f1e2d3c" * 8
+
+
+class FakePush:
+    """Records what would have gone to Apple, and can pretend a token died."""
+
+    enabled = True
+    name = "fake"
+
+    def __init__(self, drop=False):
+        self.sent = []
+        self.drop = drop
+        self.closed = False
+
+    async def send(self, token, sandbox=False):
+        self.sent.append((token, sandbox))
+        return bsapns.PushResult(not self.drop, drop=self.drop, reason="Unregistered"
+                                 if self.drop else "")
+
+    async def close(self):
+        self.closed = True
+
+
+class PushTokenTests(ServerTestCase):
+    """Registering a device for push, and forgetting it again.
+
+    The token identifies one install of the app on one device, so the rules
+    around its lifetime matter as much as the delivery it enables.
+    """
+
+    async def start_server(self, push=None, **kwargs):
+        server = bs.BootstrapServer(
+            identity_key=self.identity,
+            sms=bs.ConsoleSMSProvider(),
+            state_path=self.state_path,
+            reports_path=self.reports_path,
+            dev_fixed_code=FIXED_CODE,
+            push=push if push is not None else FakePush(),
+        )
+        server.dev_fixed_code = FIXED_CODE
+        await server.start(plaintext_port=0, allow_plaintext=True, **kwargs)
+        self.server = server
+        return server
+
+    async def _pair(self):
+        return await self.registered(ALICE), await self.registered(BOB)
+
+    @async_test
+    async def test_a_token_is_stored_and_replaced(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+
+        await alice.set_push_token(TOKEN_A)
+        self.assertEqual(self.server.push_tokens[ALICE]["token"], TOKEN_A)
+
+        # A reinstall hands out a new token; the old one must not linger, or
+        # the relay keeps waking a device that no longer has the app.
+        await alice.set_push_token(TOKEN_B)
+        self.assertEqual(self.server.push_tokens[ALICE]["token"], TOKEN_B)
+
+    @async_test
+    async def test_an_empty_token_clears_it(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        await alice.set_push_token(TOKEN_A)
+        await alice.set_push_token("")
+        self.assertNotIn(ALICE, self.server.push_tokens)
+
+    @async_test
+    async def test_a_malformed_token_is_refused(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        with self.assertRaises(ServerError) as ctx:
+            await alice.set_push_token("not-hex-at-all")
+        self.assertEqual(ctx.exception.code, "bad_request")
+        self.assertNotIn(ALICE, self.server.push_tokens)
+
+    @async_test
+    async def test_deleting_the_account_forgets_the_token(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        await alice.set_push_token(TOKEN_A)
+        await alice.delete_account()
+        self.assertNotIn(ALICE, self.server.push_tokens)
+
+    @async_test
+    async def test_the_token_follows_a_number_change(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        await alice.set_push_token(TOKEN_A)
+
+        await alice.request(bs.T_CHANGE_NUMBER_START, key=CAROL)
+        await alice.request(
+            bs.T_CHANGE_NUMBER_CONFIRM,
+            value=json.dumps({"newPhone": CAROL, "code": FIXED_CODE},
+                             separators=(",", ":")))
+
+        # Same device, new number: it must keep getting woken.
+        self.assertNotIn(ALICE, self.server.push_tokens)
+        self.assertEqual(self.server.push_tokens[CAROL]["token"], TOKEN_A)
+
+    @async_test
+    async def test_a_deposit_wakes_a_sleeping_device(self):
+        push = FakePush()
+        await self.start_server(push=push)
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A, sandbox=True)
+
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        await alice.deposit(env)
+        await asyncio.sleep(0.05)          # the push is fired, not awaited
+
+        self.assertEqual(push.sent, [(TOKEN_A, True)])
+
+    @async_test
+    async def test_no_push_for_a_device_that_is_already_listening(self):
+        push = FakePush()
+        await self.start_server(push=push)
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        fetch_task = asyncio.ensure_future(bob.fetch(wait=20))
+        await asyncio.sleep(0.25)          # let the long poll reach the hold
+
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        await alice.deposit(env)
+        await asyncio.wait_for(fetch_task, 10)
+        await asyncio.sleep(0.05)
+
+        # It is awake and holding the line; waking it again is pure waste.
+        self.assertEqual(push.sent, [])
+
+    @async_test
+    async def test_a_dead_token_is_dropped(self):
+        push = FakePush(drop=True)
+        await self.start_server(push=push)
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        await alice.deposit(env)
+        await asyncio.sleep(0.05)
+
+        # Apple said that install is gone, so the relay stops trying.
+        self.assertNotIn(BOB, self.server.push_tokens)
+
+    @async_test
+    async def test_tokens_survive_a_restart(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        await alice.set_push_token(TOKEN_A)
+        self.server.save_state()
+        await self.stop_server()
+
+        await self.start_server()
+        self.assertEqual(self.server.push_tokens[ALICE]["token"], TOKEN_A)
+
+    @async_test
+    async def test_the_token_is_never_logged(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        with self.assertLogs("hoppin-bootstrap", level="INFO") as captured:
+            await alice.set_push_token(TOKEN_A)
+        self.assertNotIn(TOKEN_A, "\n".join(captured.output))
+
+
+class APNsTests(unittest.TestCase):
+    """The parts of the APNs client that do not need Apple."""
+
+    def test_push_is_disabled_without_credentials(self):
+        sender = bsapns.build_push_sender()
+        self.assertFalse(sender.enabled)
+
+    def test_token_shape(self):
+        self.assertTrue(bsapns.is_valid_token("ab" * 32))
+        self.assertFalse(bsapns.is_valid_token("zz" * 32))   # not hex
+        self.assertFalse(bsapns.is_valid_token("abc"))       # too short
+        self.assertFalse(bsapns.is_valid_token("a" * 33))    # odd length
+
+    def test_the_payload_carries_nothing_about_the_message(self):
+        flat = json.dumps(bsapns.APNsPushSender.payload())
+        for leak in ("+351", "sender", "text", "envelope", "recipient"):
+            self.assertNotIn(leak, flat)
+        # The extension needs this, or it never gets to rewrite the placeholder.
+        self.assertEqual(bsapns.APNsPushSender.payload()["aps"]["mutable-content"], 1)
+
+    def test_a_gone_device_is_distinguished_from_a_bad_configuration(self):
+        self.assertTrue(bsapns.classify(410, '{"reason":"Unregistered"}').drop)
+        self.assertTrue(bsapns.classify(400, '{"reason":"BadDeviceToken"}').drop)
+        # Our mistake, not the device's: dropping here would silently kill push.
+        self.assertFalse(bsapns.classify(403, '{"reason":"InvalidProviderToken"}').drop)
+        self.assertFalse(bsapns.classify(429, '{"reason":"TooManyRequests"}').drop)
+        self.assertTrue(bsapns.classify(200).ok)
+
+    def test_the_jwt_is_signed_and_cached(self):
+        key = ec.generate_private_key(ec.SECP256R1())
+        pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption())
+        sender = bsapns.APNsPushSender(pem, "KEYID12345", "TEAMID6789",
+                                       "com.example.hoppin")
+
+        token = sender.bearer_token(now=1000.0)
+        header, claims, signature = token.split(".")
+
+        def unpad(part):
+            return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+        self.assertEqual(json.loads(unpad(header)),
+                         {"alg": "ES256", "kid": "KEYID12345"})
+        self.assertEqual(json.loads(unpad(claims)),
+                         {"iss": "TEAMID6789", "iat": 1000})
+        # JWS wants r||s, not DER.
+        self.assertEqual(len(unpad(signature)), 64)
+
+        # Apple throttles minting, so the same token comes back...
+        self.assertEqual(sender.bearer_token(now=1000.0 + 600), token)
+        # ...until it is old enough to be refused.
+        self.assertNotEqual(sender.bearer_token(now=1000.0 + 3600), token)
 
 
 if __name__ == "__main__":

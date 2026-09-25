@@ -348,6 +348,11 @@ class hoppinClient:
         }, separators=(",", ":"))
         await self.request(bs.T_REPORT, value=body)
 
+    async def set_push_token(self, token: str, sandbox: bool = False) -> None:
+        """Register the device's APNs token, or clear it with an empty string."""
+        value = json.dumps({"sandbox": bool(sandbox)}, separators=(",", ":"))
+        await self.request(bs.T_PUSH_TOKEN, key=token, value=value)
+
     async def delete_account(self) -> None:
         await self.request(bs.T_DELETE_ACCOUNT)
 

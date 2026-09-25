@@ -47,6 +47,8 @@ certificate, a valid wire signature, a fresh timestamp and an unseen `txID`.
 | `HOPPIN_DEV_FIXED_CODE` | – | Fixed OTP; **ignored unless `HOPPIN_ENV=dev`** |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` | – | Enables `TwilioSMSProvider` |
 | `TWILIO_FROM=whatsapp:+1...` | – | Same provider, delivered over WhatsApp instead of SMS |
+| `APNS_KEY_PATH` / `APNS_KEY_ID` / `APNS_TEAM_ID` / `APNS_TOPIC` | – | Enables push; all four required |
+| `APNS_ENV` | `production` | `sandbox` for development builds |
 
 The server **refuses to start** if no listener is configured, and in `prod`
 it refuses to start without Twilio credentials rather than silently falling

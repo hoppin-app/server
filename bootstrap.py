@@ -40,6 +40,8 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from apns import build_push_sender, is_valid_token  # noqa: E402
+
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -146,6 +148,7 @@ T_REPORT = 0x36
 T_DELETE_ACCOUNT = 0x37
 T_CHANGE_NUMBER_START = 0x38
 T_CHANGE_NUMBER_CONFIRM = 0x39
+T_PUSH_TOKEN = 0x3A
 T_HELLO = 0x40
 
 # Types the server accepts. Everything else is a bad_request.
@@ -162,6 +165,7 @@ SERVER_TYPES = {
     T_DELETE_ACCOUNT,
     T_CHANGE_NUMBER_START,
     T_CHANGE_NUMBER_CONFIRM,
+    T_PUSH_TOKEN,
 }
 
 # Types that do not carry a certificate (§3).
@@ -733,10 +737,12 @@ class BootstrapServer:
                  sms: Optional[SMSProvider] = None,
                  state_path: str = STATE_PATH,
                  reports_path: str = REPORTS_PATH,
-                 dev_fixed_code: Optional[str] = None):
+                 dev_fixed_code: Optional[str] = None,
+                 push: Optional[Any] = None):
         self.key = identity_key or load_or_create_identity_key(IDENTITY_KEY_PATH)
         self.public_b64 = public_key_b64(self.key)
         self.sms = sms or build_sms_provider()
+        self.push = push if push is not None else build_push_sender()
         self.state_path = state_path
         self.reports_path = reports_path
         self.dev_fixed_code = dev_fixed_code if IS_DEV else None
@@ -746,6 +752,10 @@ class BootstrapServer:
         self.revoked: Dict[str, int] = {}
         self.queue: Dict[str, List[Dict[str, Any]]] = {}
         self.last_seen: Dict[str, int] = {}
+        # phone -> {"token": hex, "sandbox": bool, "at": epoch}. One device per
+        # account: registering a new token replaces the old one, which is also
+        # how a reinstall stops waking the phone it left behind.
+        self.push_tokens: Dict[str, Dict[str, Any]] = {}
 
         # Volatile state.
         self.pending: Dict[str, PendingVerification] = {}
@@ -756,6 +766,9 @@ class BootstrapServer:
         self.verify_phone_counter = SlidingCounter()
         self.verify_ip_counter = SlidingCounter()
         self.lookup_counter = SlidingCounter()
+        # Pushes in flight. Held so they are not garbage-collected mid-request
+        # and so shutdown can wait for them.
+        self.push_tasks: set = set()
 
         self._dirty = False
         self._servers: List[asyncio.AbstractServer] = []
@@ -782,6 +795,10 @@ class BootstrapServer:
                       if isinstance(v, dict)}
         self.revoked = {k: int(v) for k, v in (state.get("revoked") or {}).items()}
         self.last_seen = {k: int(v) for k, v in (state.get("lastSeen") or {}).items()}
+        self.push_tokens = {
+            k: v for k, v in (state.get("pushTokens") or {}).items()
+            if isinstance(v, dict) and is_valid_token(v.get("token", ""))
+        }
         queue = state.get("queue") or {}
         self.queue = {}
         for phone, items in queue.items():
@@ -792,9 +809,10 @@ class BootstrapServer:
             if clean:
                 self.queue[phone] = clean
         self.expire_state()
-        log.info("loaded state: %d certs, %d mailboxes, %d queued envelopes",
+        log.info("loaded state: %d certs, %d mailboxes, %d queued envelopes, "
+                 "%d push tokens",
                  len(self.certs), len(self.queue),
-                 sum(len(v) for v in self.queue.values()))
+                 sum(len(v) for v in self.queue.values()), len(self.push_tokens))
 
     def save_state(self) -> None:
         state = {
@@ -803,6 +821,7 @@ class BootstrapServer:
             "revoked": self.revoked,
             "queue": self.queue,
             "lastSeen": self.last_seen,
+            "pushTokens": self.push_tokens,
         }
         try:
             atomic_write(self.state_path, json.dumps(state, separators=(",", ":")))
@@ -980,6 +999,7 @@ class BootstrapServer:
         self.last_seen.pop(phone, None)
         self.pending.pop(phone, None)
         self.mail_events.pop(phone, None)
+        self.push_tokens.pop(phone, None)
         self.touch()
 
     # -- request handling ---------------------------------------------------- #
@@ -1176,6 +1196,10 @@ class BootstrapServer:
         ev = self.mail_events.get(recipient)
         if ev is not None:
             ev.set()
+        else:
+            # Nobody is long-polling for this number, so the device is asleep
+            # or gone. That is exactly when a push is worth sending.
+            self.notify(recipient)
 
         log.info("relay deposit %s -> %s (%d bytes)",
                  mask_phone(env["senderPhone"]), mask_phone(recipient), size)
@@ -1281,6 +1305,74 @@ class BootstrapServer:
                  mask_phone(cert["phone"]), mask_phone(reported))
         return self.response(msg["txID"], T_OK)
 
+    async def h_push_token(self, msg, cert, ip):
+        """Register, replace or clear this account's APNs token.
+
+        An empty `key` clears it — the client sends that when the user turns
+        notifications off, so "stop waking my phone" never depends on deleting
+        the account.
+        """
+        phone = cert["phone"]
+        token = msg.get("key")
+        if not isinstance(token, str):
+            raise ProtocolError("bad_request", "key must be a string")
+
+        if not token:
+            if self.push_tokens.pop(phone, None) is not None:
+                self.touch()
+            return self.response(msg["txID"], T_OK)
+
+        if not is_valid_token(token):
+            raise ProtocolError("bad_request", "malformed device token")
+
+        sandbox = False
+        if msg.get("value"):
+            try:
+                body = json.loads(msg["value"])
+            except (ValueError, TypeError):
+                raise ProtocolError("bad_request", "malformed value")
+            if not isinstance(body, dict):
+                raise ProtocolError("bad_request", "malformed value")
+            sandbox = bool(body.get("sandbox"))
+
+        self.push_tokens[phone] = {
+            "token": token,
+            "sandbox": sandbox,
+            "at": int(time.time()),
+        }
+        self.touch()
+        # The token itself is never logged: it identifies one install of the
+        # app on one device for as long as it stays installed.
+        log.info("push token registered for %s", mask_phone(phone))
+        return self.response(msg["txID"], T_OK)
+
+    def notify(self, phone: str) -> None:
+        """Wake a recipient's device, if we know how. Never blocks a deposit.
+
+        Push is best-effort by design: the envelope is already in the mailbox,
+        so a failure here costs latency, not mail. A depositing client must not
+        wait on Apple, and must not learn from timing whether the recipient has
+        push registered.
+        """
+        if not getattr(self.push, "enabled", False):
+            return
+        entry = self.push_tokens.get(phone)
+        if not entry:
+            return
+
+        async def run() -> None:
+            result = await self.push.send(entry["token"], bool(entry.get("sandbox")))
+            if result.drop and self.push_tokens.get(phone, {}).get("token") == entry["token"]:
+                # Apple says that install is gone. Keeping the token would mean
+                # pushing into the void for every message from now on.
+                del self.push_tokens[phone]
+                self.touch()
+                log.info("push token dropped for %s (%s)", mask_phone(phone), result.reason)
+
+        task = asyncio.ensure_future(run())
+        self.push_tasks.add(task)
+        task.add_done_callback(self.push_tasks.discard)
+
     async def h_delete_account(self, msg, cert, ip):
         phone = cert["phone"]
         self.purge_account(phone)
@@ -1325,6 +1417,10 @@ class BootstrapServer:
         if mailbox:
             self.queue[new_phone] = mailbox
         self.last_seen.pop(old_phone, None)
+        # It is the same device, so its push token follows the account.
+        token = self.push_tokens.pop(old_phone, None)
+        if token:
+            self.push_tokens[new_phone] = token
 
         cert_out = self.issue_certificate(new_phone, cert["signingKey"],
                                           cert["agreementKey"])
@@ -1345,6 +1441,7 @@ class BootstrapServer:
         T_DELETE_ACCOUNT: h_delete_account,
         T_CHANGE_NUMBER_START: h_change_number_start,
         T_CHANGE_NUMBER_CONFIRM: h_change_number_confirm,
+        T_PUSH_TOKEN: h_push_token,
     }
 
     # -- connection handling -------------------------------------------------- #
@@ -1500,6 +1597,20 @@ class BootstrapServer:
             except Exception:
                 pass
         self._servers = []
+
+        # Pushes already in flight get a moment to finish: one of them may be
+        # the 410 that retires a dead token, and losing it means waking a
+        # device that no longer has the app until the next restart.
+        if self.push_tasks:
+            try:
+                await asyncio.wait(set(self.push_tasks), timeout=5)
+            except Exception:
+                pass
+        try:
+            await self.push.close()
+        except Exception:
+            pass
+
         self.save_state()
         log.info("server stopped; state flushed")
 
