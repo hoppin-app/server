@@ -1351,5 +1351,28 @@ class BindHostsTests(unittest.TestCase):
         self.assertEqual(bs.bind_hosts(" 10.0.0.5 "), "10.0.0.5")
 
 
+class TwilioChannelTests(unittest.TestCase):
+    """SMS or WhatsApp, chosen by the prefix on TWILIO_FROM.
+
+    Both go through the same Messages endpoint. WhatsApp needs the prefix on
+    *both* addresses, and forgetting it on "To" is a silent misdelivery.
+    """
+
+    def test_plain_from_number_is_sms(self):
+        p = bs.TwilioSMSProvider("AC1", "tok", "+15551234567")
+        self.assertEqual(p.channel, "sms")
+        self.assertEqual(p._to_field("+351911111111"), "+351911111111")
+
+    def test_alphanumeric_sender_is_sms(self):
+        p = bs.TwilioSMSProvider("AC1", "tok", "hoppin")
+        self.assertEqual(p.channel, "sms")
+        self.assertEqual(p._to_field("+351911111111"), "+351911111111")
+
+    def test_whatsapp_prefix_applies_to_both_addresses(self):
+        p = bs.TwilioSMSProvider("AC1", "tok", "whatsapp:+14155238886")
+        self.assertEqual(p.channel, "whatsapp")
+        self.assertEqual(p._to_field("+351911111111"), "whatsapp:+351911111111")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

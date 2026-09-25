@@ -46,6 +46,7 @@ certificate, a valid wire signature, a fresh timestamp and an unseen `txID`.
 | `HOPPIN_QUEUE_MAX_BYTES` | `536870912` | Global relay memory cap before oldest-first eviction |
 | `HOPPIN_DEV_FIXED_CODE` | – | Fixed OTP; **ignored unless `HOPPIN_ENV=dev`** |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` | – | Enables `TwilioSMSProvider` |
+| `TWILIO_FROM=whatsapp:+1...` | – | Same provider, delivered over WhatsApp instead of SMS |
 
 The server **refuses to start** if no listener is configured, and in `prod`
 it refuses to start without Twilio credentials rather than silently falling

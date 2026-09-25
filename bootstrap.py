@@ -586,12 +586,21 @@ class TwilioSMSProvider(SMSProvider):
         self.auth_token = auth_token
         self.from_number = from_number
 
+    @property
+    def channel(self) -> str:
+        """"whatsapp" when TWILIO_FROM carries that prefix, else plain SMS."""
+        return "whatsapp" if self.from_number.startswith("whatsapp:") else "sms"
+
+    def _to_field(self, phone: str) -> str:
+        # WhatsApp uses the same Messages endpoint; both addresses take the prefix.
+        return "whatsapp:" + phone if self.channel == "whatsapp" else phone
+
     def send(self, phone: str, code: str) -> None:
         url = "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json" % (
             urllib.parse.quote(self.account_sid)
         )
         body = urllib.parse.urlencode({
-            "To": phone,
+            "To": self._to_field(phone),
             "From": self.from_number,
             "Body": "Your hoppin verification code is %s. It expires in 10 minutes." % code,
         }).encode("ascii")
