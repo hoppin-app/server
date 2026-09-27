@@ -173,6 +173,10 @@ class APNsPushSender(PushSender):
                 "alert": {"loc-key": "NOTIFICATION_NEW_MESSAGE"},
                 "sound": "default",
                 "mutable-content": 1,
+                # Also ask iOS to wake the app, so the mailbox is drained and
+                # the receipt is on its way before the user taps anything. iOS
+                # may decline; the banner is shown either way.
+                "content-available": 1,
             }
         }
 

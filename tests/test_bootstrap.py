@@ -1563,6 +1563,8 @@ class APNsTests(unittest.TestCase):
             self.assertNotIn(leak, flat)
         # The extension needs this, or it never gets to rewrite the placeholder.
         self.assertEqual(bsapns.APNsPushSender.payload()["aps"]["mutable-content"], 1)
+        # And this is what lets the woken app go and fetch the envelope.
+        self.assertEqual(bsapns.APNsPushSender.payload()["aps"]["content-available"], 1)
 
     def test_a_gone_device_is_distinguished_from_a_bad_configuration(self):
         self.assertTrue(bsapns.classify(410, '{"reason":"Unregistered"}').drop)
