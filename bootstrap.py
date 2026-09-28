@@ -134,6 +134,10 @@ GLOBAL_QUEUE_MAX_BYTES = int(os.environ.get("HOPPIN_QUEUE_MAX_BYTES", str(512 * 
 RELAY_BATCH_BUDGET = 880 * 1024      # keep the response frame under 900 KB
 RELAY_WAIT_MAX = 25
 RELAY_MAX_MAX = 100
+# A long poll can outlive the app that made it (closed, or suspended mid-wait)
+# by up to RELAY_WAIT_MAX seconds. Mail that wakes such a poll and is still
+# unacknowledged this long afterwards gets a push anyway.
+PUSH_FALLBACK_DELAY = 15.0
 
 STATE_FLUSH_INTERVAL = 10.0
 REPORT_MAX_EVIDENCE = 20
@@ -1012,6 +1016,10 @@ class BootstrapServer:
         self.pending: Dict[str, PendingVerification] = {}
         self.txids: Dict[str, float] = {}
         self.mail_events: Dict[str, asyncio.Event] = {}
+        # phone -> long polls holding the line right now. An event in
+        # `mail_events` only means the phone polled at some point; this says
+        # whether anyone is listening at this moment.
+        self.waiting: Dict[str, int] = {}
         self.ip_buckets: Dict[str, TokenBucket] = {}
         self.ip_connections: Dict[str, int] = {}
         self.verify_phone_counter = SlidingCounter()
@@ -1021,6 +1029,10 @@ class BootstrapServer:
         # Pushes in flight. Held so they are not garbage-collected mid-request
         # and so shutdown can wait for them.
         self.push_tasks: set = set()
+        # Pushes waiting to see whether a woken poll acknowledges its mail.
+        # Cancelled, not awaited, at shutdown.
+        self.push_fallbacks: set = set()
+        self.push_fallback_delay = PUSH_FALLBACK_DELAY
 
         self._dirty = False
         self._servers: List[asyncio.AbstractServer] = []
@@ -1508,9 +1520,12 @@ class BootstrapServer:
         self.touch()
         self.enforce_global_cap()
 
-        ev = self.mail_events.get(recipient)
-        if ev is not None:
-            ev.set()
+        if self.waiting.get(recipient):
+            # A long poll is holding the line for this number: wake it. The
+            # poll may belong to an app that was closed while it waited, so if
+            # the mail is still unacknowledged a little later, push after all.
+            self.mail_event(recipient).set()
+            self.notify_if_unacked(recipient, env["id"])
         else:
             # Nobody is long-polling for this number, so the device is asleep
             # or gone. That is exactly when a push is worth sending.
@@ -1543,10 +1558,17 @@ class BootstrapServer:
         if wait > 0 and not self.queue.get(phone):
             ev = self.mail_event(phone)
             ev.clear()
+            self.waiting[phone] = self.waiting.get(phone, 0) + 1
             try:
                 await asyncio.wait_for(ev.wait(), wait)
             except asyncio.TimeoutError:
                 pass
+            finally:
+                left = self.waiting.get(phone, 1) - 1
+                if left > 0:
+                    self.waiting[phone] = left
+                else:
+                    self.waiting.pop(phone, None)
 
         now = int(time.time())
         mailbox = self.queue.get(phone, [])
@@ -1689,6 +1711,26 @@ class BootstrapServer:
         task = asyncio.ensure_future(run())
         self.push_tasks.add(task)
         task.add_done_callback(self.push_tasks.discard)
+
+    def notify_if_unacked(self, phone: str, envelope_id: str) -> None:
+        """Push later if a woken long poll never acknowledges its mail.
+
+        The poll that was woken may be an app's last, made just before it was
+        closed or suspended; the relay can't tell until the mail sits there
+        unacknowledged. A device that was really listening fetches and acks
+        within a second or two, and then no push goes out.
+        """
+        if not getattr(self.push, "enabled", False) or phone not in self.push_tokens:
+            return
+
+        async def run() -> None:
+            await asyncio.sleep(self.push_fallback_delay)
+            if any(it["env"]["id"] == envelope_id for it in self.queue.get(phone, [])):
+                self.notify(phone)
+
+        task = asyncio.ensure_future(run())
+        self.push_fallbacks.add(task)
+        task.add_done_callback(self.push_fallbacks.discard)
 
     async def h_delete_account(self, msg, cert, ip):
         phone = cert["phone"]
@@ -1931,6 +1973,8 @@ class BootstrapServer:
         # the 410 that retires a dead token, and losing it means waking a
         # device that no longer has the app until the next restart. Alerts
         # likewise.
+        for task in list(self.push_fallbacks):
+            task.cancel()
         in_flight = set(self.push_tasks) | set(self.alerts.tasks)
         if in_flight:
             try:

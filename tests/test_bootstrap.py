@@ -1819,6 +1819,62 @@ class PushTokenTests(ServerTestCase):
         self.assertEqual(push.sent, [])
 
     @async_test
+    async def test_a_device_that_listened_earlier_is_still_woken(self):
+        push = FakePush()
+        await self.start_server(push=push)
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        # The app was open a moment ago: one long poll that came back empty.
+        self.assertEqual(await bob.fetch(wait=1), [])
+
+        # Now it is closed, and mail for it has to wake it. (The relay used to
+        # remember that first poll forever and never push to this phone again.)
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        await alice.deposit(env)
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(push.sent, [(TOKEN_A, False)])
+
+    @async_test
+    async def test_a_poll_nobody_acknowledges_ends_in_a_push(self):
+        push = FakePush()
+        server = await self.start_server(push=push)
+        server.push_fallback_delay = 0.2
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        # A poll from an app that was closed while it waited: the relay wakes
+        # it and hands the mail over, but nothing ever acknowledges it.
+        fetch_task = asyncio.ensure_future(bob.fetch(wait=20))
+        await asyncio.sleep(0.25)
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        await alice.deposit(env)
+        await asyncio.wait_for(fetch_task, 10)
+        self.assertEqual(push.sent, [])
+
+        await asyncio.sleep(0.4)
+        self.assertEqual(push.sent, [(TOKEN_A, False)])
+
+    @async_test
+    async def test_an_acknowledged_poll_needs_no_push(self):
+        push = FakePush()
+        server = await self.start_server(push=push)
+        server.push_fallback_delay = 0.2
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        fetch_task = asyncio.ensure_future(bob.fetch(wait=20))
+        await asyncio.sleep(0.25)
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        await alice.deposit(env)
+        batch = await asyncio.wait_for(fetch_task, 10)
+        await bob.ack([item["id"] for item in batch])
+
+        await asyncio.sleep(0.4)
+        self.assertEqual(push.sent, [])
+
+    @async_test
     async def test_a_dead_token_is_dropped(self):
         push = FakePush(drop=True)
         await self.start_server(push=push)
