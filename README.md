@@ -43,8 +43,11 @@ certificate, a valid wire signature, a fresh timestamp and an unseen `txID`.
 | `HOPPIN_IDENTITY_KEY` | `./bootstrap_identity.key` | Server Ed25519 seed; created on first run, mode 600 |
 | `HOPPIN_STATE` | `./bootstrap_state.json` | Certificates + revoked serials + queued mail, mode 600 |
 | `HOPPIN_REPORTS` | `./reports.jsonl` | Abuse reports, one JSON object per line, mode 600 |
+| `HOPPIN_BANLIST` | `./banned.txt` | Suspended numbers, one E.164 per line (`#` comments, optional note after the number). Re-read within 5 s of a change; missing = nobody |
+| `HOPPIN_REPORT_ALERT_TO` | – | E.164 number texted (through the SMS provider) when reports arrive; at most once per 15 min, no report details |
 | `HOPPIN_QUEUE_MAX_BYTES` | `536870912` | Global relay memory cap before oldest-first eviction |
 | `HOPPIN_DEV_FIXED_CODE` | – | Fixed OTP; **ignored unless `HOPPIN_ENV=dev`** |
+| `HOPPIN_REVIEW_PHONE` / `HOPPIN_REVIEW_CODE` | – | App Review sign-in: that one E.164 number takes that fixed 6-digit code and gets no SMS, in `prod` too. Both or neither; remove after approval (see `docs/DEPLOY.md` §6) |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` / `TWILIO_FROM` | – | Enables `TwilioSMSProvider` |
 | `TWILIO_FROM=whatsapp:+1...` | – | Same provider, delivered over WhatsApp instead of SMS |
 | `APNS_KEY_PATH` / `APNS_KEY_ID` / `APNS_TEAM_ID` / `APNS_TOPIC` | – | Enables push; all four required |
@@ -196,3 +199,6 @@ envelope sealing or safety-number algorithm changes, and tell the app side.
   envelope, 7-day TTL, deduplicated by envelope id.
 * **Abuse reports** land in `HOPPIN_REPORTS` as JSON lines and contain
   user-consented plaintext evidence — treat that file as sensitive.
+* **Acting on reports**: `hoppin_admin.py` (next to `bootstrap.py`) lists
+  reports and edits the ban file — `reports [--since 24h]`, `ban <E.164>
+  [note]`, `unban <E.164>`, `banned`. See `docs/DEPLOY.md` §6d.

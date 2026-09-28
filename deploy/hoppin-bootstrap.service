@@ -5,7 +5,8 @@
 #   sudo mkdir -p /opt/hoppin /var/lib/hoppin
 #   sudo chown -R hoppin:hoppin /opt/hoppin /var/lib/hoppin
 #   sudo chmod 700 /var/lib/hoppin
-#   # copy bootstrap.py + requirements.txt to /opt/hoppin, create the venv:
+#   # copy bootstrap.py, apns.py, hoppin_admin.py + requirements.txt to
+#   # /opt/hoppin, create the venv:
 #   sudo -u hoppin python3 -m venv /opt/hoppin/venv
 #   sudo -u hoppin /opt/hoppin/venv/bin/pip install -r /opt/hoppin/requirements.txt
 #   sudo cp server/hoppin-bootstrap.service /etc/systemd/system/
@@ -32,7 +33,10 @@ Environment=HOPPIN_TLS_KEY=/etc/hoppin/tls/key.pem
 Environment=HOPPIN_IDENTITY_KEY=/var/lib/hoppin/bootstrap_identity.key
 Environment=HOPPIN_STATE=/var/lib/hoppin/bootstrap_state.json
 Environment=HOPPIN_REPORTS=/var/lib/hoppin/reports.jsonl
-# TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM live here:
+# Suspended numbers. Root edits it (hoppin_admin.py); the relay only reads it.
+Environment=HOPPIN_BANLIST=/etc/hoppin/banned.txt
+# TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM (and
+# HOPPIN_REPORT_ALERT_TO, the operator's number) live here:
 EnvironmentFile=/etc/hoppin/bootstrap.env
 
 ExecStart=/opt/hoppin/venv/bin/python /opt/hoppin/bootstrap.py

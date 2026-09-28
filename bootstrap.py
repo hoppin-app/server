@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
 from apns import build_push_sender, is_valid_token  # noqa: E402
 
@@ -65,6 +65,11 @@ ALLOW_PLAINTEXT = os.environ.get("HOPPIN_ALLOW_PLAINTEXT", "") == "1"
 IDENTITY_KEY_PATH = os.environ.get("HOPPIN_IDENTITY_KEY", "./bootstrap_identity.key")
 STATE_PATH = os.environ.get("HOPPIN_STATE", "./bootstrap_state.json")
 REPORTS_PATH = os.environ.get("HOPPIN_REPORTS", "./reports.jsonl")
+# Suspended numbers, one E.164 per line. Edited by hoppin_admin.py (or by
+# hand); the relay only ever reads it.
+BANLIST_PATH = os.environ.get("HOPPIN_BANLIST", "./banned.txt")
+# Who gets texted when a report arrives. Empty = nobody.
+REPORT_ALERT_TO = os.environ.get("HOPPIN_REPORT_ALERT_TO", "").strip()
 
 BIND_HOST = os.environ.get("HOPPIN_BIND", "0.0.0.0")
 
@@ -112,6 +117,15 @@ OTP_TTL = 600                        # 10 minutes
 OTP_MAX_ATTEMPTS = 5
 OTP_RESEND_AFTER = 60                # retryAfter hint returned to the client
 
+# App Review number (guideline 2.1): one configured number with a fixed code.
+# Its code never changes, so wrong guesses add up across requests instead of
+# resetting with each new code. The daily cap is what bounds brute force; the
+# per-number start limit is looser than usual because no SMS is ever sent.
+REVIEW_CODE_LENGTH = 6               # the app's code field takes exactly 6 digits
+REVIEW_START_PER_PHONE = 10          # per hour
+REVIEW_MAX_FAILURES = 10             # wrong codes per REVIEW_FAILURE_WINDOW
+REVIEW_FAILURE_WINDOW = 86400
+
 QUEUE_MAX_ENVELOPES = 500            # per recipient
 QUEUE_MAX_BYTES = 20 * 1024 * 1024   # per recipient
 ENVELOPE_MAX_BYTES = 900 * 1024
@@ -123,6 +137,8 @@ RELAY_MAX_MAX = 100
 
 STATE_FLUSH_INTERVAL = 10.0
 REPORT_MAX_EVIDENCE = 20
+REPORT_ALERT_WINDOW = 15 * 60        # at most one operator text per window
+BANLIST_CHECK_INTERVAL = 5.0         # seconds between stat() calls on the ban file
 
 # --- message types (§3) ----------------------------------------------------- #
 
@@ -552,6 +568,10 @@ class SlidingCounter:
         self._hits[key] = hits
         return True
 
+    def count(self, key: str) -> int:
+        now = time.monotonic()
+        return sum(1 for t in self._hits.get(key, []) if now - t < self.window)
+
     def purge(self) -> None:
         now = time.monotonic()
         for key in list(self._hits):
@@ -570,6 +590,11 @@ class SMSProvider:
     name = "none"
 
     def send(self, phone: str, code: str) -> None:  # pragma: no cover - interface
+        """A verification code."""
+        raise NotImplementedError
+
+    def send_text(self, phone: str, body: str) -> None:  # pragma: no cover - interface
+        """Any other text, e.g. the operator's report alert. Blocking."""
         raise NotImplementedError
 
 
@@ -580,6 +605,9 @@ class ConsoleSMSProvider(SMSProvider):
 
     def send(self, phone: str, code: str) -> None:
         log.info("[dev-sms] %s -> code %s", mask_phone(phone), code)
+
+    def send_text(self, phone: str, body: str) -> None:
+        log.info("[dev-sms] %s -> %s", mask_phone(phone), body)
 
 
 class TwilioSMSProvider(SMSProvider):
@@ -600,13 +628,17 @@ class TwilioSMSProvider(SMSProvider):
         return "whatsapp:" + phone if self.channel == "whatsapp" else phone
 
     def send(self, phone: str, code: str) -> None:
+        self.send_text(phone, "Your hoppin verification code is %s. "
+                              "It expires in 10 minutes." % code)
+
+    def send_text(self, phone: str, text: str) -> None:
         url = "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json" % (
             urllib.parse.quote(self.account_sid)
         )
         body = urllib.parse.urlencode({
             "To": self._to_field(phone),
             "From": self.from_number,
-            "Body": "Your hoppin verification code is %s. It expires in 10 minutes." % code,
+            "Body": text,
         }).encode("ascii")
         auth = base64.b64encode(
             ("%s:%s" % (self.account_sid, self.auth_token)).encode("utf-8")
@@ -639,6 +671,206 @@ def build_sms_provider() -> SMSProvider:
         "refusing to start: no SMS provider configured. Set TWILIO_ACCOUNT_SID, "
         "TWILIO_AUTH_TOKEN and TWILIO_FROM, or run with HOPPIN_ENV=dev."
     )
+
+
+def parse_review_number(phone: Optional[str],
+                        code: Optional[str]) -> Optional[Tuple[str, str]]:
+    """The App Review sign-in, from HOPPIN_REVIEW_PHONE and HOPPIN_REVIEW_CODE.
+
+    Returns (phone, code), or None when the feature is off. A half-set or
+    malformed pair logs an error and stays off rather than stopping the relay.
+    Neither value is ever logged: the number may be real, the code is a secret.
+    """
+    phone = (phone or "").strip()
+    code = (code or "").strip()
+    if not phone and not code:
+        return None
+    if not phone or not code:
+        log.error("review number OFF: set both HOPPIN_REVIEW_PHONE and "
+                  "HOPPIN_REVIEW_CODE, or neither")
+        return None
+    if not is_valid_e164(phone):
+        log.error("review number OFF: HOPPIN_REVIEW_PHONE must be E.164, "
+                  "like +447700900123")
+        return None
+    if len(code) != REVIEW_CODE_LENGTH or not (code.isascii() and code.isdigit()):
+        log.error("review number OFF: HOPPIN_REVIEW_CODE must be exactly %d digits",
+                  REVIEW_CODE_LENGTH)
+        return None
+    return phone, code
+
+
+# ---------------------------------------------------------------------------
+# Moderation: suspended numbers and report alerts
+# ---------------------------------------------------------------------------
+
+def parse_banlist(text: str) -> Dict[str, str]:
+    """Ban file -> {phone: note}.
+
+    One E.164 number per line; anything after it is a free-text note. Blank
+    lines and lines starting with '#' are ignored, and so is any line that
+    doesn't start with a valid number (it is reported by line number only).
+    """
+    banned: Dict[str, str] = {}
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if not is_valid_e164(parts[0]):
+            log.warning("ban list line %d is not an E.164 number; ignored", lineno)
+            continue
+        banned[parts[0]] = parts[1].strip() if len(parts) > 1 else ""
+    return banned
+
+
+class BanList:
+    """The operator's list of suspended numbers, read from a plain text file.
+
+    The file is re-read when it changes, so a ban takes effect without a
+    restart. `refresh` stats it at most once every `check_interval` seconds;
+    between checks, lookups are a set membership test. A missing file means
+    nobody is banned. An unreadable one keeps the last list that could be read,
+    because failing open would quietly unban everyone.
+    """
+
+    def __init__(self, path: str, check_interval: float = BANLIST_CHECK_INTERVAL,
+                 clock=time.monotonic):
+        self.path = path
+        self.check_interval = check_interval
+        self.clock = clock
+        self.numbers: Dict[str, str] = {}
+        self._stamp: Optional[Tuple[int, ...]] = None
+        self._checked_at: Optional[float] = None
+
+    def __contains__(self, phone: str) -> bool:
+        return phone in self.numbers
+
+    def __len__(self) -> int:
+        return len(self.numbers)
+
+    def refresh(self, force: bool = False) -> bool:
+        """Re-read the file if it changed. Returns True when the list did."""
+        now = self.clock()
+        if (not force and self._checked_at is not None
+                and now - self._checked_at < self.check_interval):
+            return False
+        self._checked_at = now
+
+        try:
+            st = os.stat(self.path)
+            # ctime too: a chmod that makes the file readable again changes
+            # nothing else, and must still be picked up.
+            stamp: Optional[Tuple[int, ...]] = (
+                st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
+        except FileNotFoundError:
+            stamp = None
+        except OSError as exc:
+            log.error("cannot stat ban list %s: %s", self.path, exc.__class__.__name__)
+            return False
+        if stamp == self._stamp and not force:
+            return False
+        self._stamp = stamp
+
+        if stamp is None:
+            numbers: Dict[str, str] = {}
+        else:
+            try:
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    numbers = parse_banlist(fh.read())
+            except (OSError, UnicodeDecodeError) as exc:
+                log.error("cannot read ban list %s (%s); keeping the previous %d "
+                          "number(s)", self.path, exc.__class__.__name__,
+                          len(self.numbers))
+                return False
+
+        changed = numbers.keys() != self.numbers.keys()
+        self.numbers = numbers
+        if changed or force:
+            log.info("ban list: %d suspended number(s)", len(numbers))
+        return changed
+
+
+def report_alert_text(count: int) -> str:
+    """The operator's text. Deliberately says nothing about the reports: no
+    numbers, no reasons, no evidence — SMS is neither private nor ours."""
+    if count == 1:
+        return "hoppin: 1 new report. Review it on the relay."
+    return "hoppin: %d new reports. Review them on the relay." % count
+
+
+class ReportAlerter:
+    """Texts the operator when reports arrive, at most once per `window`.
+
+    The first report after a quiet spell is alerted at once. Reports inside
+    the window after an alert are counted, and `tick()` (run by housekeeping)
+    sends one alert for all of them when the window closes — so a report is
+    never left unannounced just because no second one arrived.
+
+    Sending is fire-and-forget: the SMS goes out on a worker thread, and a
+    failed alert is folded back into the next one.
+    """
+
+    def __init__(self, sms: SMSProvider, to: str,
+                 window: float = REPORT_ALERT_WINDOW, clock=time.monotonic):
+        self.sms = sms
+        self.to = to if is_valid_e164(to) else ""
+        self.window = window
+        self.clock = clock
+        self.pending = 0
+        self.last_sent: Optional[float] = None
+        # Alerts in flight, held like BootstrapServer.push_tasks.
+        self.tasks: set = set()
+        if not to:
+            log.info("report alerts are off (HOPPIN_REPORT_ALERT_TO is not set)")
+        elif not self.to:
+            log.error("report alerts are off: HOPPIN_REPORT_ALERT_TO is not E.164")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.to)
+
+    def report_filed(self) -> None:
+        if not self.enabled:
+            return
+        self.pending += 1
+        self.tick()
+
+    def tick(self) -> None:
+        """Send what is pending if the window allows it."""
+        if not self.enabled or self.pending <= 0:
+            return
+        now = self.clock()
+        if self.last_sent is not None and now - self.last_sent < self.window:
+            return
+        self._send(now)
+
+    def flush(self) -> None:
+        """Send what is pending now, window or not. Used on shutdown, so a
+        restart inside the window doesn't swallow a report."""
+        if self.enabled and self.pending > 0:
+            self._send(self.clock())
+
+    def _send(self, now: float) -> None:
+        count, self.pending = self.pending, 0
+        self.last_sent = now
+        text = report_alert_text(count)
+
+        async def run() -> None:
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.run_in_executor(None, self.sms.send_text, self.to, text)
+                log.info("report alert sent (%d report(s))", count)
+            except Exception as exc:
+                # Folded into the next alert, which tick() sends once the
+                # window has passed.
+                self.pending += count
+                log.error("report alert failed (%s); will retry",
+                          getattr(exc, "code", exc.__class__.__name__))
+
+        task = asyncio.ensure_future(run())
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -720,15 +952,17 @@ def append_jsonl(path: str, record: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 class PendingVerification:
-    __slots__ = ("salt", "digest", "expires_at", "attempts", "new_phone")
+    __slots__ = ("salt", "digest", "expires_at", "attempts", "new_phone", "review")
 
     def __init__(self, salt: bytes, digest: bytes, expires_at: float,
-                 new_phone: Optional[str] = None):
+                 new_phone: Optional[str] = None, review: bool = False):
         self.salt = salt
         self.digest = digest
         self.expires_at = expires_at
         self.attempts = 0
         self.new_phone = new_phone
+        # True when the number being verified is the App Review number.
+        self.review = review
 
 
 class BootstrapServer:
@@ -738,7 +972,11 @@ class BootstrapServer:
                  state_path: str = STATE_PATH,
                  reports_path: str = REPORTS_PATH,
                  dev_fixed_code: Optional[str] = None,
-                 push: Optional[Any] = None):
+                 push: Optional[Any] = None,
+                 review_phone: Optional[str] = None,
+                 review_code: Optional[str] = None,
+                 banlist_path: str = BANLIST_PATH,
+                 report_alert_to: Optional[str] = None):
         self.key = identity_key or load_or_create_identity_key(IDENTITY_KEY_PATH)
         self.public_b64 = public_key_b64(self.key)
         self.sms = sms or build_sms_provider()
@@ -746,12 +984,25 @@ class BootstrapServer:
         self.state_path = state_path
         self.reports_path = reports_path
         self.dev_fixed_code = dev_fixed_code if IS_DEV else None
+        self.bans = BanList(banlist_path)
+        self.alerts = ReportAlerter(
+            self.sms, REPORT_ALERT_TO if report_alert_to is None else report_alert_to)
+
+        # App Review number. Works in prod too, but only for this exact number;
+        # it has nothing to do with dev_fixed_code.
+        self.review_phone: Optional[str] = None
+        self.review_code: Optional[str] = None
+        review = parse_review_number(review_phone, review_code)
+        if review is not None:
+            self.review_phone, self.review_code = review
+            log.warning("review number ON for %s: fixed code, no SMS. "
+                        "Remove it once App Review is done.",
+                        mask_phone(self.review_phone))
 
         # Persisted state.
         self.certs: Dict[str, Dict[str, Any]] = {}
         self.revoked: Dict[str, int] = {}
         self.queue: Dict[str, List[Dict[str, Any]]] = {}
-        self.last_seen: Dict[str, int] = {}
         # phone -> {"token": hex, "sandbox": bool, "at": epoch}. One device per
         # account: registering a new token replaces the old one, which is also
         # how a reinstall stops waking the phone it left behind.
@@ -766,6 +1017,7 @@ class BootstrapServer:
         self.verify_phone_counter = SlidingCounter()
         self.verify_ip_counter = SlidingCounter()
         self.lookup_counter = SlidingCounter()
+        self.review_failures = SlidingCounter(REVIEW_FAILURE_WINDOW)
         # Pushes in flight. Held so they are not garbage-collected mid-request
         # and so shutdown can wait for them.
         self.push_tasks: set = set()
@@ -794,7 +1046,8 @@ class BootstrapServer:
         self.certs = {k: v for k, v in (state.get("certs") or {}).items()
                       if isinstance(v, dict)}
         self.revoked = {k: int(v) for k, v in (state.get("revoked") or {}).items()}
-        self.last_seen = {k: int(v) for k, v in (state.get("lastSeen") or {}).items()}
+        # Older state files also carry "lastSeen". It is no longer kept, so it
+        # is ignored here and gone from the file after the next save.
         self.push_tokens = {
             k: v for k, v in (state.get("pushTokens") or {}).items()
             if isinstance(v, dict) and is_valid_token(v.get("token", ""))
@@ -820,7 +1073,6 @@ class BootstrapServer:
             "certs": self.certs,
             "revoked": self.revoked,
             "queue": self.queue,
-            "lastSeen": self.last_seen,
             "pushTokens": self.push_tokens,
         }
         try:
@@ -858,6 +1110,7 @@ class BootstrapServer:
         self.verify_phone_counter.purge()
         self.verify_ip_counter.purge()
         self.lookup_counter.purge()
+        self.review_failures.purge()
         self.enforce_global_cap()
 
     def queue_bytes(self) -> int:
@@ -930,26 +1183,59 @@ class BootstrapServer:
     def _hash_code(salt: bytes, code: str) -> bytes:
         return hashlib.sha256(salt + code.encode("ascii")).digest()
 
+    def is_review_number(self, phone: Optional[str]) -> bool:
+        return self.review_phone is not None and phone == self.review_phone
+
+    def review_locked(self) -> bool:
+        return self.review_failures.count("review") >= REVIEW_MAX_FAILURES
+
     def start_verification(self, phone: str, ip: str,
                            new_phone: Optional[str] = None) -> int:
         """Create/replace a pending OTP and send it. Returns retryAfter seconds."""
-        if not self.verify_phone_counter.hit("p:" + phone, VERIFY_START_PER_PHONE):
+        target = new_phone or phone
+        review = self.is_review_number(target)
+        if review and self.review_locked():
+            raise ProtocolError("rate_limited", "too many attempts for this number")
+        per_phone = REVIEW_START_PER_PHONE if review else VERIFY_START_PER_PHONE
+        if not self.verify_phone_counter.hit("p:" + phone, per_phone):
             raise ProtocolError("rate_limited", "too many codes requested for this number")
         if not self.verify_ip_counter.hit("i:" + ip, VERIFY_START_PER_IP):
             raise ProtocolError("rate_limited", "too many codes requested from this address")
 
-        code = self._generate_code()
+        code = self.review_code if review else self._generate_code()
         salt = secrets.token_bytes(16)
-        target = new_phone or phone
         self.pending[phone] = PendingVerification(
             salt=salt,
             digest=self._hash_code(salt, code),
             expires_at=time.monotonic() + OTP_TTL,
             new_phone=new_phone,
+            review=review,
         )
+        if review:
+            # No SMS: the reviewer has the code from the review notes, and the
+            # provider is never called, so it costs nothing.
+            log.info("review number: code requested for %s, no SMS sent",
+                     mask_phone(target))
+            return OTP_RESEND_AFTER
         self.sms.send(target, code)
         log.info("verification code sent to %s", mask_phone(target))
         return OTP_RESEND_AFTER
+
+    def _code_failed(self, phone: str, pv: PendingVerification) -> NoReturn:
+        """Count a wrong attempt, and raise the error the client should see."""
+        pv.attempts += 1
+        if pv.review:
+            self.review_failures.hit("review", REVIEW_MAX_FAILURES)
+            log.warning("review number: wrong code for %s (%d of %d allowed per day)",
+                        mask_phone(pv.new_phone or phone),
+                        self.review_failures.count("review"), REVIEW_MAX_FAILURES)
+            if self.review_locked():
+                del self.pending[phone]
+                raise ProtocolError("too_many_attempts", "too many attempts")
+        if pv.attempts >= OTP_MAX_ATTEMPTS:
+            del self.pending[phone]
+            raise ProtocolError("too_many_attempts", "too many attempts")
+        raise ProtocolError("invalid_code", "verification code is not valid")
 
     def check_code(self, phone: str, code: str,
                    expect_new_phone: Optional[str] = None) -> None:
@@ -959,22 +1245,18 @@ class BootstrapServer:
         if pv.expires_at <= time.monotonic():
             del self.pending[phone]
             raise ProtocolError("code_expired", "verification code expired")
-        if pv.attempts >= OTP_MAX_ATTEMPTS:
+        if pv.attempts >= OTP_MAX_ATTEMPTS or (pv.review and self.review_locked()):
             del self.pending[phone]
             raise ProtocolError("too_many_attempts", "too many attempts")
         if expect_new_phone is not None and pv.new_phone != expect_new_phone:
-            pv.attempts += 1
-            raise ProtocolError("invalid_code", "verification code is not valid")
+            self._code_failed(phone, pv)
         if not isinstance(code, str) or not code:
-            pv.attempts += 1
-            raise ProtocolError("invalid_code", "verification code is not valid")
+            self._code_failed(phone, pv)
         if not hmac.compare_digest(pv.digest, self._hash_code(pv.salt, code)):
-            pv.attempts += 1
-            if pv.attempts >= OTP_MAX_ATTEMPTS:
-                del self.pending[phone]
-                raise ProtocolError("too_many_attempts", "too many attempts")
-            raise ProtocolError("invalid_code", "verification code is not valid")
+            self._code_failed(phone, pv)
         del self.pending[phone]
+        if pv.review:
+            log.info("review number signed in: %s", mask_phone(pv.new_phone or phone))
 
     # -- certificate issuance ----------------------------------------------- #
 
@@ -986,7 +1268,6 @@ class BootstrapServer:
             self.revoked[previous["serial"]] = now + REVOKED_TTL
         cert = make_certificate(self.key, phone, signing_key, agreement_key, now)
         self.certs[phone] = cert
-        self.last_seen[phone] = now
         self.touch()
         log.info("issued certificate for %s", mask_phone(phone))
         return cert
@@ -996,11 +1277,29 @@ class BootstrapServer:
         if cert and isinstance(cert.get("serial"), str):
             self.revoked[cert["serial"]] = int(time.time()) + REVOKED_TTL
         self.queue.pop(phone, None)
-        self.last_seen.pop(phone, None)
         self.pending.pop(phone, None)
         self.mail_events.pop(phone, None)
         self.push_tokens.pop(phone, None)
         self.touch()
+
+    # -- suspended numbers ---------------------------------------------------- #
+
+    def refresh_bans(self, force: bool = False) -> None:
+        """Pick up edits to the ban file (throttled by BanList)."""
+        if self.bans.refresh(force=force) or force:
+            self._apply_bans()
+
+    def _apply_bans(self) -> None:
+        """A suspended number stops being woken. Its certificate and mailbox
+        stay, so an unban restores the account as it was."""
+        for phone in [p for p in self.push_tokens if p in self.bans]:
+            del self.push_tokens[phone]
+            self.touch()
+            log.info("push token dropped for suspended %s", mask_phone(phone))
+
+    def is_suspended(self, phone: str) -> bool:
+        self.refresh_bans()
+        return phone in self.bans
 
     # -- request handling ---------------------------------------------------- #
 
@@ -1043,6 +1342,11 @@ class BootstrapServer:
         cert: Optional[Dict[str, Any]] = None
         if msg_type not in UNAUTHENTICATED_TYPES:
             cert = self.authenticate(msg)
+            # A suspended account can do exactly one thing: delete its data.
+            if msg_type != T_DELETE_ACCOUNT and self.is_suspended(cert["phone"]):
+                log.info("refused request 0x%02x from suspended %s",
+                         msg_type, mask_phone(cert["phone"]))
+                raise ProtocolError("suspended", "this number has been suspended")
 
         handler = self.HANDLERS[msg_type]
         return await handler(self, msg, cert, ip)
@@ -1075,8 +1379,6 @@ class BootstrapServer:
     # -- handlers ------------------------------------------------------------ #
 
     async def h_ping(self, msg, cert, ip):
-        self.last_seen[cert["phone"]] = int(time.time())
-        self.touch()
         return self.response(msg["txID"], T_PONG)
 
     async def h_verify_start(self, msg, cert, ip):
@@ -1087,6 +1389,12 @@ class BootstrapServer:
         # but that key is not on the wire yet, so it cannot be verified here.
         # verifyConfirm carries the key and binds it to the code, which is where
         # the actual authentication happens. verifyStart is rate limited only.
+        if self.is_suspended(phone):
+            # Metered like a real start, so the list can't be probed for free.
+            if not self.verify_ip_counter.hit("i:" + ip, VERIFY_START_PER_IP):
+                raise ProtocolError("rate_limited", "too many codes requested from this address")
+            log.info("verification refused for suspended %s", mask_phone(phone))
+            raise ProtocolError("suspended", "this number has been suspended")
         retry_after = self.start_verification(phone, ip)
         return self.response(msg["txID"], T_VERIFY_STARTED, value=str(retry_after))
 
@@ -1115,6 +1423,11 @@ class BootstrapServer:
             raise ProtocolError("bad_signature", "wire signature does not verify")
 
         self.check_code(phone, code if isinstance(code, str) else "")
+        # Checked after the code, so only the number's owner learns the answer:
+        # this catches a ban that landed between verifyStart and now.
+        if self.is_suspended(phone):
+            log.info("verification refused for suspended %s", mask_phone(phone))
+            raise ProtocolError("suspended", "this number has been suspended")
         cert_out = self.issue_certificate(phone, signing_key, agreement_key)
         return self.response(msg["txID"], T_CERTIFICATE_ISSUED,
                              value=encode_certificate(cert_out))
@@ -1140,7 +1453,8 @@ class BootstrapServer:
             raise ProtocolError("invalid_phone", "phone must be E.164")
         if not self.lookup_counter.hit("l:" + cert["phone"], CERT_LOOKUP_PER_CALLER):
             raise ProtocolError("rate_limited", "too many lookups")
-        found = self.certs.get(target)
+        # A suspended number looks exactly like one that was never registered.
+        found = None if self.is_suspended(target) else self.certs.get(target)
         value = encode_certificate(found) if found else ""
         return self.response(msg["txID"], T_CERT_RESULT, value=value)
 
@@ -1170,8 +1484,9 @@ class BootstrapServer:
         # Mail for a number with no current certificate (never registered, or
         # deleted) could never be fetched — refuse it rather than let anyone
         # fill a dead mailbox. The answer reveals registration status, so it
-        # is metered exactly like certLookup to stop cheap enumeration.
-        if recipient not in self.certs:
+        # is metered exactly like certLookup to stop cheap enumeration. A
+        # suspended number gets the same answer.
+        if recipient not in self.certs or self.is_suspended(recipient):
             if not self.lookup_counter.hit("l:" + cert["phone"], CERT_LOOKUP_PER_CALLER):
                 raise ProtocolError("rate_limited", "too many lookups")
             raise ProtocolError("recipient_not_registered",
@@ -1223,7 +1538,6 @@ class BootstrapServer:
         max_items = max(1, min(RELAY_MAX_MAX, max_items))
 
         phone = cert["phone"]
-        self.last_seen[phone] = int(time.time())
 
         # Long poll: hold the connection until mail arrives or `wait` elapses.
         if wait > 0 and not self.queue.get(phone):
@@ -1303,6 +1617,9 @@ class BootstrapServer:
             raise ProtocolError("internal", "could not store report")
         log.info("report filed by %s against %s",
                  mask_phone(cert["phone"]), mask_phone(reported))
+        # The Terms promise a human looks within 24 hours. Never awaited: the
+        # reporter's answer doesn't depend on the operator's phone.
+        self.alerts.report_filed()
         return self.response(msg["txID"], T_OK)
 
     async def h_push_token(self, msg, cert, ip):
@@ -1385,6 +1702,8 @@ class BootstrapServer:
             raise ProtocolError("invalid_phone", "phone must be E.164")
         if new_phone == cert["phone"]:
             raise ProtocolError("bad_request", "new number equals current number")
+        if self.is_suspended(new_phone):
+            raise ProtocolError("suspended", "that number has been suspended")
         if new_phone in self.certs:
             raise ProtocolError("bad_request", "number already registered")
         retry_after = self.start_verification(cert["phone"], ip, new_phone=new_phone)
@@ -1401,6 +1720,8 @@ class BootstrapServer:
         code = body.get("code")
         if not isinstance(new_phone, str) or not is_valid_e164(new_phone):
             raise ProtocolError("invalid_phone", "phone must be E.164")
+        if self.is_suspended(new_phone):
+            raise ProtocolError("suspended", "that number has been suspended")
         if new_phone in self.certs:
             raise ProtocolError("bad_request", "number already registered")
 
@@ -1416,7 +1737,6 @@ class BootstrapServer:
         mailbox = self.queue.pop(old_phone, None)
         if mailbox:
             self.queue[new_phone] = mailbox
-        self.last_seen.pop(old_phone, None)
         # It is the same device, so its push token follows the account.
         token = self.push_tokens.pop(old_phone, None)
         if token:
@@ -1526,6 +1846,7 @@ class BootstrapServer:
                     tls_cert: str = "", tls_key: str = "",
                     allow_plaintext: Optional[bool] = None) -> None:
         self.load_state()
+        self.refresh_bans(force=True)
 
         if allow_plaintext is None:
             allow_plaintext = ALLOW_PLAINTEXT
@@ -1575,6 +1896,10 @@ class BootstrapServer:
                 except asyncio.TimeoutError:
                     pass
                 self.expire_state()
+                # Notice a new ban even when the banned phone is silent, and
+                # send the alert for reports held back by the window.
+                self.refresh_bans()
+                self.alerts.tick()
                 if self._dirty:
                     self.save_state()
         except asyncio.CancelledError:
@@ -1598,12 +1923,18 @@ class BootstrapServer:
                 pass
         self._servers = []
 
+        # A report held back by the alert window would otherwise be forgotten
+        # by the restart; one extra text is the lesser evil.
+        self.alerts.flush()
+
         # Pushes already in flight get a moment to finish: one of them may be
         # the 410 that retires a dead token, and losing it means waking a
-        # device that no longer has the app until the next restart.
-        if self.push_tasks:
+        # device that no longer has the app until the next restart. Alerts
+        # likewise.
+        in_flight = set(self.push_tasks) | set(self.alerts.tasks)
+        if in_flight:
             try:
-                await asyncio.wait(set(self.push_tasks), timeout=5)
+                await asyncio.wait(in_flight, timeout=5)
             except Exception:
                 pass
         try:
@@ -1622,6 +1953,8 @@ class BootstrapServer:
 async def _amain() -> None:
     server = BootstrapServer(
         dev_fixed_code=os.environ.get("HOPPIN_DEV_FIXED_CODE") or None,
+        review_phone=os.environ.get("HOPPIN_REVIEW_PHONE"),
+        review_code=os.environ.get("HOPPIN_REVIEW_CODE"),
     )
     await server.start(tls_cert=TLS_CERT, tls_key=TLS_KEY)
 

@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import datetime
+import io
 import json
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -26,6 +29,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -38,6 +42,7 @@ os.environ.setdefault("HOPPIN_ENV", "dev")
 
 import bootstrap as bs  # noqa: E402
 import apns as bsapns  # noqa: E402
+import hoppin_admin  # noqa: E402
 from client import (  # noqa: E402
     hoppinClient,
     ServerError,
@@ -120,6 +125,7 @@ class ServerTestCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="hoppin-test-")
         self.state_path = os.path.join(self.tmp, "state.json")
         self.reports_path = os.path.join(self.tmp, "reports.jsonl")
+        self.banlist_path = os.path.join(self.tmp, "banned.txt")
         self.identity = Ed25519PrivateKey.generate()
         self.server = None
 
@@ -144,6 +150,8 @@ class ServerTestCase(unittest.TestCase):
             state_path=self.state_path,
             reports_path=self.reports_path,
             dev_fixed_code=FIXED_CODE,
+            banlist_path=self.banlist_path,
+            report_alert_to="",
         )
         server.dev_fixed_code = FIXED_CODE
         await server.start(plaintext_port=0, allow_plaintext=True, **kwargs)
@@ -444,7 +452,11 @@ class HijackTests(ServerTestCase):
             await mallory.send(msg)
         self.assertEqual(ctx.exception.code, "cert_invalid")
         self.assertNotIn(ALICE, self.server.certs)
-        self.assertNotIn(ALICE, self.server.last_seen)
+        # Nothing was marked for saving, and nothing about the number is saved.
+        self.assertFalse(self.server._dirty)
+        self.server.save_state()
+        with open(self.state_path, "r", encoding="utf-8") as fh:
+            self.assertNotIn(ALICE, fh.read())
 
     @async_test
     async def test_superseded_certificate_cannot_act(self):
@@ -552,6 +564,263 @@ class VerificationTests(ServerTestCase):
         reply = await alice.request(bs.T_VERIFY_START, key=ALICE,
                                     with_certificate=False)
         self.assertNotIn(FIXED_CODE, json.dumps(reply))
+
+
+# ---------------------------------------------------------------------------
+# App Review number (guideline 2.1)
+# ---------------------------------------------------------------------------
+
+REVIEW_PHONE = "+447700900555"
+REVIEW_CODE = "480213"
+OTHER_CODE = "654321"
+
+
+class RecordingSMS(bs.SMSProvider):
+    """Records what would have been texted, instead of texting it."""
+
+    name = "recording"
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, phone, code):
+        self.sent.append((phone, code))
+
+
+class CapturedLog:
+    """Collects the relay's log lines for the duration of a `with` block."""
+
+    def __enter__(self):
+        import logging
+
+        records = self.records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        self.handler = Capture()
+        self.level = bs.log.level
+        bs.log.addHandler(self.handler)
+        bs.log.setLevel(logging.INFO)
+        return self
+
+    def __exit__(self, *exc):
+        bs.log.removeHandler(self.handler)
+        bs.log.setLevel(self.level)
+        return False
+
+    @property
+    def text(self):
+        return "\n".join(self.records)
+
+
+class ReviewConfigTests(unittest.TestCase):
+    """HOPPIN_REVIEW_PHONE / HOPPIN_REVIEW_CODE: both valid, or the feature is off."""
+
+    def parse(self, phone, code):
+        with CapturedLog() as captured:
+            result = bs.parse_review_number(phone, code)
+        # Whatever went wrong, the log never repeats the values themselves.
+        for value in (phone, code):
+            if value and value.strip():
+                self.assertNotIn(value.strip(), captured.text)
+        return result, captured.text
+
+    def test_unset_is_off_and_quiet(self):
+        self.assertEqual(self.parse(None, None), (None, ""))
+        self.assertEqual(self.parse("", "  "), (None, ""))
+
+    def test_valid_pair_is_on(self):
+        result, _ = self.parse(" %s " % REVIEW_PHONE, " %s\n" % REVIEW_CODE)
+        self.assertEqual(result, (REVIEW_PHONE, REVIEW_CODE))
+
+    def test_half_set_or_malformed_is_off_with_an_error(self):
+        cases = [
+            (REVIEW_PHONE, None),
+            (None, REVIEW_CODE),
+            ("447700900555", REVIEW_CODE),        # no "+"
+            ("+44 7700 900555", REVIEW_CODE),     # not E.164 as written
+            (REVIEW_PHONE, "48021"),              # too short
+            (REVIEW_PHONE, "4802131"),            # the app only takes 6 digits
+            (REVIEW_PHONE, "48o213"),
+            (REVIEW_PHONE, "４８０２１３"),  # fullwidth digits
+        ]
+        for phone, code in cases:
+            with self.subTest(phone=phone, code=code):
+                result, text = self.parse(phone, code)
+                self.assertIsNone(result)
+                self.assertIn("review number OFF", text)
+
+
+class ReviewNumberTests(ServerTestCase):
+    """One configured number signs in with a fixed code and never costs an SMS.
+
+    It has to work in production, so these run with IS_DEV off. Every other
+    number must behave exactly as before, and a code that never changes must
+    not turn that one number into something anyone can guess their way into.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._was_dev = bs.IS_DEV
+        bs.IS_DEV = False
+
+    def tearDown(self):
+        bs.IS_DEV = self._was_dev
+        super().tearDown()
+
+    async def start_server(self, review_phone=REVIEW_PHONE,
+                           review_code=REVIEW_CODE, **kwargs):
+        self.sms = RecordingSMS()
+        server = bs.BootstrapServer(
+            identity_key=self.identity,
+            sms=self.sms,
+            state_path=self.state_path,
+            reports_path=self.reports_path,
+            dev_fixed_code=FIXED_CODE,          # must be ignored outside dev
+            review_phone=review_phone,
+            review_code=review_code,
+        )
+        await server.start(plaintext_port=0, allow_plaintext=True, **kwargs)
+        self.server = server
+        return server
+
+    @async_test
+    async def test_review_number_signs_in_without_an_sms(self):
+        await self.start_server()
+        reviewer = self.client(REVIEW_PHONE)
+        self.assertEqual(await reviewer.verify_start(), bs.OTP_RESEND_AFTER)
+        cert = await reviewer.verify_confirm(REVIEW_CODE)
+
+        self.assertEqual(cert["phone"], REVIEW_PHONE)
+        self.assertEqual(self.sms.sent, [], "the SMS provider must not be called")
+        self.assertEqual((await reviewer.ping())["type"], bs.T_PONG)
+
+    @async_test
+    async def test_other_numbers_are_untouched(self):
+        await self.start_server()
+        self.assertIsNone(self.server.dev_fixed_code)    # the dev path stays shut
+        self.server._generate_code = lambda: OTHER_CODE
+
+        alice = self.client(ALICE)
+        await alice.verify_start()
+        self.assertEqual(self.sms.sent, [(ALICE, OTHER_CODE)])
+
+        for code in (REVIEW_CODE, FIXED_CODE):
+            with self.assertRaises(ServerError) as ctx:
+                await alice.verify_confirm(code)
+            self.assertEqual(ctx.exception.code, "invalid_code")
+
+        cert = await alice.verify_confirm(OTHER_CODE)
+        self.assertEqual(cert["phone"], ALICE)
+
+    @async_test
+    async def test_changing_away_from_the_review_number_texts_the_new_one(self):
+        await self.start_server()
+        reviewer = self.client(REVIEW_PHONE)
+        await reviewer.verify_start()
+        await reviewer.verify_confirm(REVIEW_CODE)
+        self.server._generate_code = lambda: OTHER_CODE
+
+        # The number being verified is CAROL's, so she gets a real code.
+        await reviewer.change_number_start(CAROL)
+        self.assertEqual(self.sms.sent, [(CAROL, OTHER_CODE)])
+        with self.assertRaises(ServerError) as ctx:
+            await reviewer.change_number_confirm(CAROL, REVIEW_CODE)
+        self.assertEqual(ctx.exception.code, "invalid_code")
+
+        cert = await reviewer.change_number_confirm(CAROL, OTHER_CODE)
+        self.assertEqual(cert["phone"], CAROL)
+
+    @async_test
+    async def test_a_reviewer_may_ask_for_a_few_more_codes(self):
+        await self.start_server()
+        reviewer = self.client(REVIEW_PHONE)
+        # More than an ordinary number gets, since no SMS is sent...
+        for _ in range(bs.REVIEW_START_PER_PHONE):
+            await reviewer.verify_start()
+        self.assertGreater(bs.REVIEW_START_PER_PHONE, bs.VERIFY_START_PER_PHONE)
+        # ...but still a limit.
+        with self.assertRaises(ServerError) as ctx:
+            await reviewer.verify_start()
+        self.assertEqual(ctx.exception.code, "rate_limited")
+        # The code still works after all those requests.
+        cert = await reviewer.verify_confirm(REVIEW_CODE)
+        self.assertEqual(cert["phone"], REVIEW_PHONE)
+
+    @async_test
+    async def test_wrong_guesses_add_up_across_code_requests(self):
+        """A fresh request normally means a fresh code; here it does not, so
+        wrong guesses are capped per day for the number, not per request."""
+        await self.start_server()
+        reviewer = self.client(REVIEW_PHONE)
+        wrong = "000000"
+        self.assertNotEqual(wrong, REVIEW_CODE)
+
+        left = bs.REVIEW_MAX_FAILURES - 1
+        while left:
+            await reviewer.verify_start()
+            for _ in range(min(bs.OTP_MAX_ATTEMPTS - 1, left)):
+                with self.assertRaises(ServerError) as ctx:
+                    await reviewer.verify_confirm(wrong)
+                self.assertEqual(ctx.exception.code, "invalid_code")
+                left -= 1
+
+        # The last allowed wrong guess locks the number...
+        with self.assertRaises(ServerError) as ctx:
+            await reviewer.verify_confirm(wrong)
+        self.assertEqual(ctx.exception.code, "too_many_attempts")
+
+        # ...so no new code can be requested, and the right one gets nowhere.
+        with self.assertRaises(ServerError) as ctx:
+            await reviewer.verify_start()
+        self.assertEqual(ctx.exception.code, "rate_limited")
+        with self.assertRaises(ServerError):
+            await reviewer.verify_confirm(REVIEW_CODE)
+        self.assertNotIn(REVIEW_PHONE, self.server.certs)
+
+        # Nobody else is affected.
+        await self.client(ALICE).verify_start()
+        self.assertEqual(len(self.sms.sent), 1)
+
+    @async_test
+    async def test_a_locked_review_number_refuses_even_the_right_code(self):
+        await self.start_server()
+        reviewer = self.client(REVIEW_PHONE)
+        await reviewer.verify_start()
+        for _ in range(bs.REVIEW_MAX_FAILURES):
+            self.server.review_failures.hit("review", bs.REVIEW_MAX_FAILURES)
+
+        with self.assertRaises(ServerError) as ctx:
+            await reviewer.verify_confirm(REVIEW_CODE)
+        self.assertEqual(ctx.exception.code, "too_many_attempts")
+        self.assertNotIn(REVIEW_PHONE, self.server.certs)
+
+    @async_test
+    async def test_invalid_config_leaves_the_relay_up_and_the_feature_off(self):
+        await self.start_server(review_code="12345")
+        self.assertIsNone(self.server.review_phone)
+
+        reviewer = self.client(REVIEW_PHONE)
+        await reviewer.verify_start()
+        # An ordinary number now: a real SMS, and no fixed code.
+        self.assertEqual([p for p, _ in self.sms.sent], [REVIEW_PHONE])
+
+    @async_test
+    async def test_sign_in_is_logged_masked_and_the_code_never(self):
+        with CapturedLog() as captured:
+            await self.start_server()
+            reviewer = self.client(REVIEW_PHONE)
+            await reviewer.verify_start()
+            with self.assertRaises(ServerError):
+                await reviewer.verify_confirm("000000")
+            await reviewer.verify_confirm(REVIEW_CODE)
+
+        self.assertNotIn(REVIEW_CODE, captured.text)
+        self.assertNotIn(REVIEW_PHONE, captured.text)
+        self.assertIn("review number signed in: %s" % bs.mask_phone(REVIEW_PHONE),
+                      captured.text)
 
 
 # ---------------------------------------------------------------------------
@@ -857,6 +1126,11 @@ class AccountTests(ServerTestCase):
         self.assertNotIn(ALICE, self.server.certs)
         self.assertIn(new_phone, self.server.certs)
 
+        # The old number leaves no trace in the saved state.
+        self.server.save_state()
+        with open(self.state_path, "r", encoding="utf-8") as fh:
+            self.assertNotIn(ALICE, fh.read())
+
         # The old certificate can no longer be used.
         stale = self.client(ALICE)
         stale.signing = alice.signing
@@ -905,8 +1179,14 @@ class AccountTests(ServerTestCase):
 
         self.assertNotIn(ALICE, self.server.certs)
         self.assertNotIn(ALICE, self.server.queue)
-        self.assertNotIn(ALICE, self.server.last_seen)
         self.assertIn(serial, self.server.revoked)
+
+        # The saved state keeps the revoked serial and nothing with her number.
+        self.server.save_state()
+        with open(self.state_path, "r", encoding="utf-8") as fh:
+            saved = fh.read()
+        self.assertNotIn(ALICE, saved)
+        self.assertIn(serial, saved)
 
         # Alice is no longer discoverable.
         self.assertIsNone(await bob.cert_lookup(ALICE))
@@ -966,6 +1246,32 @@ class PersistenceTests(ServerTestCase):
         bob.server_key_b64 = self.server.public_b64
         mail = await bob.fetch(wait=0)
         self.assertEqual(len(mail), 1)
+
+    @async_test
+    async def test_old_state_with_last_seen_loads_and_drops_it(self):
+        """lastSeen was stored and never read; the relay no longer keeps it."""
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        await alice.ping()
+        await alice.fetch(wait=0)
+        self.server.save_state()
+        await self.stop_server()
+
+        with open(self.state_path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        self.assertNotIn("lastSeen", state)
+
+        # A state file written by an older relay still has it.
+        state["lastSeen"] = {ALICE: int(time.time())}
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+
+        await self.start_server()
+        self.assertEqual(self.server.certs[ALICE]["serial"],
+                         alice.certificate["serial"])
+        self.server.save_state()
+        with open(self.state_path, "r", encoding="utf-8") as fh:
+            self.assertNotIn("lastSeen", json.load(fh))
 
     @async_test
     async def test_state_file_is_mode_600(self):
@@ -1416,6 +1722,8 @@ class PushTokenTests(ServerTestCase):
             reports_path=self.reports_path,
             dev_fixed_code=FIXED_CODE,
             push=push if push is not None else FakePush(),
+            banlist_path=self.banlist_path,
+            report_alert_to="",
         )
         server.dev_fixed_code = FIXED_CODE
         await server.start(plaintext_port=0, allow_plaintext=True, **kwargs)
@@ -1600,6 +1908,550 @@ class APNsTests(unittest.TestCase):
         self.assertEqual(sender.bearer_token(now=1000.0 + 600), token)
         # ...until it is old enough to be refused.
         self.assertNotEqual(sender.bearer_token(now=1000.0 + 3600), token)
+
+
+# ---------------------------------------------------------------------------
+# Moderation: suspended numbers, report alerts, the admin tool
+# ---------------------------------------------------------------------------
+
+OPERATOR = "+351935550199"
+
+
+class FakeSMS(bs.SMSProvider):
+    """Records codes and texts instead of sending them; can pretend to fail."""
+
+    name = "fake"
+
+    def __init__(self, fail=False):
+        self.codes = []
+        self.texts = []
+        self.fail = fail
+
+    def send(self, phone, code):
+        self.codes.append((phone, code))
+
+    def send_text(self, phone, body):
+        if self.fail:
+            raise bs.ProtocolError("internal", "sms send failed")
+        self.texts.append((phone, body))
+
+
+class FakeClock:
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def write_file(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+class BanListTests(unittest.TestCase):
+    """The ban file: its format, and when the relay re-reads it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hoppin-ban-")
+        self.path = os.path.join(self.tmp, "banned.txt")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_format(self):
+        text = ("# suspended numbers\n"
+                "\n"
+                "%s\n"
+                "  %s   spam, 2026-09-28  \n"
+                "not-a-number whatever\n"
+                "# %s commented out\n" % (ALICE, BOB, CAROL))
+        self.assertEqual(bs.parse_banlist(text),
+                         {ALICE: "", BOB: "spam, 2026-09-28"})
+
+    def test_a_missing_file_bans_nobody(self):
+        bans = bs.BanList(self.path)
+        bans.refresh(force=True)
+        self.assertEqual(len(bans), 0)
+        self.assertNotIn(ALICE, bans)
+
+    def test_reloads_on_change_but_stats_at_most_every_interval(self):
+        clock = FakeClock()
+        bans = bs.BanList(self.path, check_interval=5, clock=clock)
+        write_file(self.path, ALICE + "\n")
+        bans.refresh(force=True)
+        self.assertIn(ALICE, bans)
+
+        write_file(self.path, BOB + "\n")
+        clock.advance(1)
+        with mock.patch.object(bs.os, "stat", wraps=os.stat) as stat_call:
+            self.assertFalse(bans.refresh())      # too soon: not even a stat
+            self.assertEqual(stat_call.call_count, 0)
+        self.assertIn(ALICE, bans)
+
+        clock.advance(5)
+        self.assertTrue(bans.refresh())
+        self.assertIn(BOB, bans)
+        self.assertNotIn(ALICE, bans)
+
+    def test_an_unchanged_file_is_not_read_again(self):
+        clock = FakeClock()
+        bans = bs.BanList(self.path, check_interval=5, clock=clock)
+        write_file(self.path, ALICE + "\n")
+        with mock.patch.object(bs, "parse_banlist", wraps=bs.parse_banlist) as parse:
+            bans.refresh(force=True)
+            for _ in range(5):
+                clock.advance(10)
+                bans.refresh()
+            self.assertEqual(parse.call_count, 1)
+        self.assertIn(ALICE, bans)
+
+    def test_deleting_the_file_lifts_every_ban(self):
+        bans = bs.BanList(self.path, check_interval=0)
+        write_file(self.path, ALICE + "\n")
+        bans.refresh()
+        os.unlink(self.path)
+        bans.refresh()
+        self.assertNotIn(ALICE, bans)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads anything")
+    def test_an_unreadable_file_keeps_the_last_list(self):
+        bans = bs.BanList(self.path, check_interval=0)
+        write_file(self.path, ALICE + "\n")
+        bans.refresh()
+        os.chmod(self.path, 0)
+        try:
+            bans.refresh()
+            # Failing open would quietly unban everyone.
+            self.assertIn(ALICE, bans)
+        finally:
+            os.chmod(self.path, 0o600)
+
+
+class SuspensionTests(ServerTestCase):
+    """A suspended number can't use the relay, and looks unregistered to others."""
+
+    async def start_server(self, push=None, **kwargs):
+        server = bs.BootstrapServer(
+            identity_key=self.identity,
+            sms=bs.ConsoleSMSProvider(),
+            state_path=self.state_path,
+            reports_path=self.reports_path,
+            dev_fixed_code=FIXED_CODE,
+            push=push if push is not None else FakePush(),
+            banlist_path=self.banlist_path,
+            report_alert_to="",
+        )
+        server.dev_fixed_code = FIXED_CODE
+        await server.start(plaintext_port=0, allow_plaintext=True, **kwargs)
+        # Every request re-checks the file, so a test sees its edit at once.
+        server.bans.check_interval = 0
+        self.server = server
+        return server
+
+    def ban(self, *phones):
+        write_file(self.banlist_path, "".join(p + " test\n" for p in phones))
+
+    async def assert_suspended(self, coro):
+        with self.assertRaises(ServerError) as ctx:
+            await coro
+        self.assertEqual(ctx.exception.code, "suspended")
+
+    @async_test
+    async def test_cannot_start_verification(self):
+        await self.start_server()
+        self.ban(ALICE)
+        await self.assert_suspended(self.client(ALICE).verify_start())
+        self.assertNotIn(ALICE, self.server.pending)
+
+    @async_test
+    async def test_cannot_confirm_a_code_sent_before_the_ban(self):
+        await self.start_server()
+        alice = self.client(ALICE)
+        await alice.verify_start()
+        self.ban(ALICE)
+        await self.assert_suspended(alice.verify_confirm(FIXED_CODE))
+        self.assertNotIn(ALICE, self.server.certs)
+
+    @async_test
+    async def test_cannot_renew_deposit_or_change_number(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        bob = await self.registered(BOB)
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        self.ban(ALICE)
+
+        await self.assert_suspended(alice.cert_renew())
+        await self.assert_suspended(alice.deposit(env))
+        await self.assert_suspended(alice.change_number_start(CAROL))
+        await self.assert_suspended(alice.ping())
+        await self.assert_suspended(alice.fetch(wait=0))
+        await self.assert_suspended(alice.cert_lookup(BOB))
+        await self.assert_suspended(alice.report(BOB, "spam", []))
+        await self.assert_suspended(alice.set_push_token(TOKEN_A))
+
+        self.assertNotIn(BOB, self.server.queue)
+        self.assertNotIn(ALICE, self.server.pending)
+
+    @async_test
+    async def test_can_still_delete_the_account(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        self.ban(ALICE)
+        await alice.delete_account()
+        self.assertNotIn(ALICE, self.server.certs)
+
+    @async_test
+    async def test_cannot_change_to_a_suspended_number(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        self.ban(CAROL)
+        await self.assert_suspended(alice.change_number_start(CAROL))
+
+        # A ban landing between start and confirm is caught too.
+        self.ban()
+        await alice.change_number_start(CAROL)
+        self.ban(CAROL)
+        await self.assert_suspended(alice.change_number_confirm(CAROL, FIXED_CODE))
+        self.assertIn(ALICE, self.server.certs)
+        self.assertNotIn(CAROL, self.server.certs)
+
+    @async_test
+    async def test_lookup_hides_a_suspended_number_until_unbanned(self):
+        await self.start_server()
+        bob = await self.registered(BOB)
+        alice = await self.registered(ALICE)
+
+        self.ban(BOB)
+        self.assertIsNone(await alice.cert_lookup(BOB))
+
+        self.ban()
+        found = await alice.cert_lookup(BOB)
+        self.assertEqual(found["serial"], bob.certificate["serial"])
+
+    @async_test
+    async def test_deposit_to_a_suspended_number_fails_as_unregistered(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        bob = await self.registered(BOB)
+        first = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        second = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":2}')
+        await alice.deposit(first)
+
+        self.ban(BOB)
+        with self.assertRaises(ServerError) as ctx:
+            await alice.deposit(second)
+        self.assertEqual(ctx.exception.code, "recipient_not_registered")
+
+        # Nothing is deleted: the certificate and the mail already queued stay.
+        self.assertIn(BOB, self.server.certs)
+        self.assertEqual([it["env"]["id"] for it in self.server.queue[BOB]],
+                         [first["id"]])
+
+        # ...so lifting the ban restores the account as it was.
+        self.ban()
+        await alice.deposit(second)
+        self.assertEqual(len(await bob.fetch(wait=0)), 2)
+
+    @async_test
+    async def test_the_push_token_is_dropped_once_the_ban_is_noticed(self):
+        push = FakePush()
+        await self.start_server(push=push)
+        alice = await self.registered(ALICE)
+        bob = await self.registered(BOB)
+        await bob.set_push_token(TOKEN_A)
+        await alice.set_push_token(TOKEN_B)
+
+        self.ban(BOB)
+        # What housekeeping does every few seconds, with no request needed.
+        self.server.refresh_bans()
+        self.assertNotIn(BOB, self.server.push_tokens)
+        self.assertEqual(self.server.push_tokens[ALICE]["token"], TOKEN_B)
+        self.assertIn(BOB, self.server.certs)
+
+        with self.assertRaises(ServerError):
+            await alice.deposit(alice.seal_to(bob.certificate,
+                                              b'{"kind":"text","sentAt":1}'))
+        await asyncio.sleep(0.05)
+        self.assertEqual(push.sent, [])
+
+    @async_test
+    async def test_a_ban_already_in_the_file_applies_at_startup(self):
+        await self.start_server()
+        bob = await self.registered(BOB)
+        await bob.set_push_token(TOKEN_A)
+        self.server.save_state()
+        await self.stop_server()
+
+        self.ban(BOB)
+        await self.start_server()
+        self.assertNotIn(BOB, self.server.push_tokens)
+        bob.port = self.server.plaintext_port
+        await self.assert_suspended(bob.ping())
+
+    @async_test
+    async def test_edits_apply_without_a_restart(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        await alice.ping()
+
+        hoppin_admin.ban(self.banlist_path, ALICE, "spam")
+        await self.assert_suspended(alice.ping())
+
+        hoppin_admin.unban(self.banlist_path, ALICE)
+        reply = await alice.ping()
+        self.assertEqual(reply["type"], bs.T_PONG)
+
+    @async_test
+    async def test_refusals_log_only_masked_numbers(self):
+        await self.start_server()
+        alice = await self.registered(ALICE)
+        self.ban(ALICE)
+        with self.assertLogs("hoppin-bootstrap", level="INFO") as captured:
+            await self.assert_suspended(alice.ping())
+            await self.assert_suspended(self.client(ALICE).verify_start())
+        blob = "\n".join(captured.output)
+        self.assertNotIn(ALICE, blob)
+        self.assertIn(bs.mask_phone(ALICE), blob)
+
+
+class ReportAlertTests(ServerTestCase):
+    """The operator is texted when reports arrive, and told nothing else."""
+
+    def alerter(self, sms, to=OPERATOR):
+        self.clock = FakeClock()
+        return bs.ReportAlerter(sms, to, window=15 * 60, clock=self.clock)
+
+    async def drain(self, alerter):
+        if alerter.tasks:
+            await asyncio.wait(set(alerter.tasks), timeout=5)
+
+    async def start_server(self, sms, **kwargs):
+        server = bs.BootstrapServer(
+            identity_key=self.identity,
+            sms=sms,
+            state_path=self.state_path,
+            reports_path=self.reports_path,
+            dev_fixed_code=FIXED_CODE,
+            push=FakePush(),
+            banlist_path=self.banlist_path,
+            report_alert_to=OPERATOR,
+        )
+        server.dev_fixed_code = FIXED_CODE
+        await server.start(plaintext_port=0, allow_plaintext=True, **kwargs)
+        self.clock = FakeClock()
+        server.alerts.clock = self.clock
+        self.server = server
+        return server
+
+    @async_test
+    async def test_the_first_report_alerts_at_once(self):
+        sms = FakeSMS()
+        alerts = self.alerter(sms)
+        alerts.report_filed()
+        await self.drain(alerts)
+        self.assertEqual(sms.texts,
+                         [(OPERATOR, "hoppin: 1 new report. Review it on the relay.")])
+
+    @async_test
+    async def test_reports_inside_the_window_are_coalesced(self):
+        sms = FakeSMS()
+        alerts = self.alerter(sms)
+        alerts.report_filed()
+        await self.drain(alerts)
+
+        self.clock.advance(60)
+        alerts.report_filed()
+        self.clock.advance(60)
+        alerts.report_filed()
+        alerts.report_filed()
+        alerts.tick()
+        await self.drain(alerts)
+        self.assertEqual(len(sms.texts), 1, "only one alert per window")
+
+        # The window closes: one text for everything held back, even though
+        # no further report arrived to trigger it.
+        self.clock.advance(15 * 60 - 120)
+        alerts.tick()
+        await self.drain(alerts)
+        self.assertEqual(len(sms.texts), 2)
+        self.assertEqual(sms.texts[1][1],
+                         "hoppin: 3 new reports. Review them on the relay.")
+
+        # Nothing pending: the next tick is silent.
+        self.clock.advance(15 * 60)
+        alerts.tick()
+        await self.drain(alerts)
+        self.assertEqual(len(sms.texts), 2)
+
+    @async_test
+    async def test_alerts_are_off_without_a_recipient(self):
+        sms = FakeSMS()
+        with self.assertLogs("hoppin-bootstrap", level="INFO") as captured:
+            alerts = self.alerter(sms, to="")
+        self.assertIn("report alerts are off", "\n".join(captured.output))
+        alerts.report_filed()
+        self.assertEqual(alerts.tasks, set())
+        self.assertEqual(sms.texts, [])
+
+    @async_test
+    async def test_a_report_texts_the_operator_without_any_detail(self):
+        sms = FakeSMS()
+        await self.start_server(sms)
+        alice = await self.registered(ALICE)
+        await alice.report(BOB, "he keeps texting 912345678 at 3am",
+                           [{"id": "m1", "timestamp": 1, "text": "call +447700900123"}])
+        await self.drain(self.server.alerts)
+
+        self.assertEqual(len(sms.texts), 1)
+        to, body = sms.texts[0]
+        self.assertEqual(to, OPERATOR)
+        for phone in (ALICE, BOB, CAROL, OPERATOR):
+            digits = phone.lstrip("+")
+            self.assertNotIn(digits, body)
+            self.assertNotIn(digits[-4:], body)
+        self.assertIsNone(re.search(r"\d{2,}", body), body)
+        self.assertNotIn("+", body)
+        for leak in ("texting", "3am", "call", "spam"):
+            self.assertNotIn(leak, body)
+
+    @async_test
+    async def test_a_failed_alert_never_fails_the_report_and_is_retried(self):
+        sms = FakeSMS(fail=True)
+        await self.start_server(sms)
+        alice = await self.registered(ALICE)
+        await alice.report(BOB, "spam", [])       # answered ok, not internal
+        self.assertTrue(os.path.exists(self.reports_path))
+        await self.drain(self.server.alerts)
+        self.assertEqual(sms.texts, [])
+        self.assertEqual(self.server.alerts.pending, 1)
+
+        sms.fail = False
+        self.clock.advance(15 * 60)
+        self.server.alerts.tick()
+        await self.drain(self.server.alerts)
+        self.assertEqual(sms.texts[0][1], bs.report_alert_text(1))
+
+    @async_test
+    async def test_held_back_reports_are_sent_on_shutdown(self):
+        sms = FakeSMS()
+        await self.start_server(sms)
+        alice = await self.registered(ALICE)
+        await alice.report(BOB, "spam", [])
+        await alice.report(CAROL, "spam", [])
+        await self.drain(self.server.alerts)
+        self.assertEqual(len(sms.texts), 1)
+
+        await self.stop_server()
+        self.assertEqual([body for _, body in sms.texts],
+                         [bs.report_alert_text(1), bs.report_alert_text(1)])
+
+
+class AdminToolTests(unittest.TestCase):
+    """hoppin_admin.py: the operator's side of reports and bans."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="hoppin-admin-")
+        self.banlist = os.path.join(self.tmp, "banned.txt")
+        self.reports = os.path.join(self.tmp, "reports.jsonl")
+        # Never consult a real systemd unit from a test.
+        self._saved_env = hoppin_admin._service_env
+        hoppin_admin._service_env = {}
+
+    def tearDown(self):
+        hoppin_admin._service_env = self._saved_env
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = hoppin_admin.main(["--banlist", self.banlist,
+                                      "--reports", self.reports] + list(argv))
+        return code, out.getvalue()
+
+    def test_ban_unban_round_trip_preserves_the_file(self):
+        original = "# suspended numbers\n%s  2026-09-01 old case\n" % CAROL
+        write_file(self.banlist, original)
+        os.chmod(self.banlist, 0o640)
+        before = os.stat(self.banlist)
+
+        self.assertTrue(hoppin_admin.ban(self.banlist, BOB, "spam  links",
+                                         today="2026-09-28"))
+        after = os.stat(self.banlist)
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o640)
+        self.assertEqual((after.st_uid, after.st_gid), (before.st_uid, before.st_gid))
+        self.assertNotEqual(after.st_ino, before.st_ino, "expected an atomic rename")
+        with open(self.banlist, encoding="utf-8") as fh:
+            self.assertEqual(bs.parse_banlist(fh.read()),
+                             {CAROL: "2026-09-01 old case", BOB: "2026-09-28 spam links"})
+
+        self.assertFalse(hoppin_admin.ban(self.banlist, BOB, "again"))
+
+        self.assertTrue(hoppin_admin.unban(self.banlist, BOB))
+        self.assertFalse(hoppin_admin.unban(self.banlist, BOB))
+        with open(self.banlist, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), original)
+        self.assertEqual(stat.S_IMODE(os.stat(self.banlist).st_mode), 0o640)
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.endswith(".tmp")], [])
+
+    def test_a_new_ban_file_is_group_readable_only(self):
+        hoppin_admin.ban(self.banlist, BOB, "")
+        self.assertEqual(stat.S_IMODE(os.stat(self.banlist).st_mode), 0o640)
+
+    def test_the_relay_sees_what_the_tool_writes(self):
+        bans = bs.BanList(self.banlist, check_interval=0)
+        bans.refresh()
+        code, _ = self.run_cli("ban", BOB, "spam")
+        self.assertEqual(code, 0)
+        self.assertTrue(bans.refresh())
+        self.assertIn(BOB, bans)
+
+        code, out = self.run_cli("banned")
+        self.assertIn(BOB, out)
+
+        self.run_cli("unban", BOB)
+        self.assertTrue(bans.refresh())
+        self.assertNotIn(BOB, bans)
+
+    def test_numbers_must_be_e164(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                self.run_cli("ban", "912345678")
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertFalse(os.path.exists(self.banlist))
+
+    def test_reports_newest_first_with_since(self):
+        now = int(time.time())
+        lines = [
+            {"at": now - 3 * 86400, "reporter": ALICE, "reportedPhone": CAROL,
+             "reason": "old", "evidence": []},
+            {"at": now - 60, "reporter": ALICE, "reportedPhone": BOB,
+             "reason": "spam\x1b[2J", "evidence": [{"id": "1", "timestamp": now,
+                                                    "text": "hi"}] * 2},
+            {"at": now - 3600, "reporter": CAROL, "reportedPhone": BOB,
+             "reason": "abuse", "evidence": []},
+        ]
+        write_file(self.reports, "".join(json.dumps(l) + "\n" for l in lines)
+                   + "not json\n")
+        write_file(self.banlist, BOB + "\n")
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, out = self.run_cli("reports")
+        self.assertEqual(code, 0)
+        self.assertLess(out.index("spam"), out.index("abuse"))
+        self.assertLess(out.index("abuse"), out.index("old"))
+        self.assertIn("evidence  2 message(s)", out)
+        self.assertIn("(suspended)", out)
+        # Reporter-written text can't drive the operator's terminal.
+        self.assertNotIn("\x1b", out)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, out = self.run_cli("reports", "--since", "24h")
+        self.assertIn("2 report(s)", out)
+        self.assertNotIn("old", out)
 
 
 if __name__ == "__main__":
