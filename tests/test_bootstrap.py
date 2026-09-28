@@ -2213,7 +2213,7 @@ class SuspensionTests(ServerTestCase):
         self.assertEqual(len(await bob.fetch(wait=0)), 2)
 
     @async_test
-    async def test_the_push_token_is_dropped_once_the_ban_is_noticed(self):
+    async def test_a_suspended_number_is_not_pushed_to_but_keeps_its_token(self):
         push = FakePush()
         await self.start_server(push=push)
         alice = await self.registered(ALICE)
@@ -2224,15 +2224,25 @@ class SuspensionTests(ServerTestCase):
         self.ban(BOB)
         # What housekeeping does every few seconds, with no request needed.
         self.server.refresh_bans()
-        self.assertNotIn(BOB, self.server.push_tokens)
-        self.assertEqual(self.server.push_tokens[ALICE]["token"], TOKEN_B)
         self.assertIn(BOB, self.server.certs)
 
         with self.assertRaises(ServerError):
             await alice.deposit(alice.seal_to(bob.certificate,
                                               b'{"kind":"text","sentAt":1}'))
+        # Even a wake-up that was already on its way goes nowhere.
+        self.server.notify(BOB)
         await asyncio.sleep(0.05)
         self.assertEqual(push.sent, [])
+
+        # The token outlives the ban. The phone won't send it again unless it
+        # changes, so dropping it would have left push off after an unban.
+        self.assertEqual(self.server.push_tokens[BOB]["token"], TOKEN_A)
+        self.ban()
+        self.server.refresh_bans(force=True)
+        await alice.deposit(alice.seal_to(bob.certificate,
+                                          b'{"kind":"text","sentAt":2}'))
+        await asyncio.sleep(0.05)
+        self.assertEqual([token for token, _ in push.sent], [TOKEN_A])
 
     @async_test
     async def test_a_ban_already_in_the_file_applies_at_startup(self):
@@ -2244,9 +2254,10 @@ class SuspensionTests(ServerTestCase):
 
         self.ban(BOB)
         await self.start_server()
-        self.assertNotIn(BOB, self.server.push_tokens)
         bob.port = self.server.plaintext_port
         await self.assert_suspended(bob.ping())
+        # Kept for when the ban is lifted; notify won't use it until then.
+        self.assertEqual(self.server.push_tokens[BOB]["token"], TOKEN_A)
 
     @async_test
     async def test_edits_apply_without_a_restart(self):

@@ -1297,17 +1297,13 @@ class BootstrapServer:
     # -- suspended numbers ---------------------------------------------------- #
 
     def refresh_bans(self, force: bool = False) -> None:
-        """Pick up edits to the ban file (throttled by BanList)."""
-        if self.bans.refresh(force=force) or force:
-            self._apply_bans()
+        """Pick up edits to the ban file (throttled by BanList).
 
-    def _apply_bans(self) -> None:
-        """A suspended number stops being woken. Its certificate and mailbox
-        stay, so an unban restores the account as it was."""
-        for phone in [p for p in self.push_tokens if p in self.bans]:
-            del self.push_tokens[phone]
-            self.touch()
-            log.info("push token dropped for suspended %s", mask_phone(phone))
+        Nothing is deleted when a number is suspended: its certificate,
+        mailbox and push token stay, so an unban restores the account as it
+        was. `notify` is what keeps a suspended phone from being woken.
+        """
+        self.bans.refresh(force=force)
 
     def is_suspended(self, phone: str) -> bool:
         self.refresh_bans()
@@ -1695,6 +1691,11 @@ class BootstrapServer:
         """
         if not getattr(self.push, "enabled", False):
             return
+        # A suspended number is never woken, but its token is kept: the phone
+        # only sends a token again when it changes, so one dropped here would
+        # leave push off for good after the ban is lifted.
+        if self.is_suspended(phone):
+            return
         entry = self.push_tokens.get(phone)
         if not entry:
             return
@@ -1938,7 +1939,7 @@ class BootstrapServer:
                 except asyncio.TimeoutError:
                     pass
                 self.expire_state()
-                # Notice a new ban even when the banned phone is silent, and
+                # Pick up ban-file edits even when no request arrives, and
                 # send the alert for reports held back by the window.
                 self.refresh_bans()
                 self.alerts.tick()
