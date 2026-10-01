@@ -1477,6 +1477,25 @@ class BootstrapServer:
 
         if env["senderPhone"] != msg.get("senderPhone"):
             raise ProtocolError("bad_request", "envelope sender does not match")
+
+        # Whether this envelope should ring the recipient's phone. The relay
+        # can't see inside, so the sender says: a message or a photo does, a
+        # receipt, profile update or address hint doesn't — pushed, those read
+        # as a phantom "New message". Apps from before the flag send nothing
+        # and keep the old behaviour.
+        notify = True
+        if msg.get("value"):
+            try:
+                body = json.loads(msg["value"])
+            except (ValueError, TypeError):
+                raise ProtocolError("bad_request", "malformed value")
+            if not isinstance(body, dict):
+                raise ProtocolError("bad_request", "malformed value")
+            if "notify" in body:
+                if not isinstance(body["notify"], bool):
+                    raise ProtocolError("bad_request", "notify must be true or false")
+                notify = body["notify"]
+
         recipient = msg.get("recipientPhone")
         if not isinstance(recipient, str) or not is_valid_e164(recipient):
             raise ProtocolError("invalid_phone", "recipientPhone must be E.164")
@@ -1521,8 +1540,9 @@ class BootstrapServer:
             # poll may belong to an app that was closed while it waited, so if
             # the mail is still unacknowledged a little later, push after all.
             self.mail_event(recipient).set()
-            self.notify_if_unacked(recipient, env["id"])
-        else:
+            if notify:
+                self.notify_if_unacked(recipient, env["id"])
+        elif notify:
             # Nobody is long-polling for this number, so the device is asleep
             # or gone. That is exactly when a push is worth sending.
             self.notify(recipient)

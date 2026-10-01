@@ -324,9 +324,16 @@ class hoppinClient:
         value = reply.get("value") or ""
         return json.loads(value) if value else None
 
-    async def deposit(self, envelope: Dict[str, Any]) -> str:
+    async def deposit(self, envelope: Dict[str, Any],
+                      notify: Optional[bool] = None) -> str:
+        """Deposit an envelope. `notify` is the app's "ring their phone" flag;
+        None sends no flag at all, like apps from before it existed."""
+        extra: Dict[str, Any] = {}
+        if notify is not None:
+            extra["value"] = json.dumps({"notify": notify}, separators=(",", ":"))
         reply = await self.request(bs.T_RELAY_DEPOSIT, envelope=envelope,
-                                   recipient_phone=envelope["recipientPhone"])
+                                   recipient_phone=envelope["recipientPhone"],
+                                   **extra)
         return reply.get("key", "")
 
     async def fetch(self, wait: int = 0, max_items: int = 100,

@@ -1875,6 +1875,66 @@ class PushTokenTests(ServerTestCase):
         self.assertEqual(push.sent, [])
 
     @async_test
+    async def test_a_receipt_does_not_ring_the_phone(self):
+        push = FakePush()
+        await self.start_server(push=push)
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        # Bob's app is closed. Alice's read receipt still goes in his mailbox,
+        # but it mustn't ring his phone with a "New message" that isn't one.
+        receipt = alice.seal_to(bob.certificate, b'{"kind":"readReceipt","sentAt":1}')
+        await alice.deposit(receipt, notify=False)
+        await asyncio.sleep(0.05)
+        self.assertEqual(push.sent, [])
+        self.assertEqual([it["env"]["id"] for it in self.server.queue[BOB]],
+                         [receipt["id"]])
+
+        # A message does.
+        message = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":2}')
+        await alice.deposit(message, notify=True)
+        await asyncio.sleep(0.05)
+        self.assertEqual(push.sent, [(TOKEN_A, False)])
+
+    @async_test
+    async def test_a_quiet_deposit_wakes_a_listening_app_but_never_pushes(self):
+        push = FakePush()
+        server = await self.start_server(push=push)
+        server.push_fallback_delay = 0.2
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        fetch_task = asyncio.ensure_future(bob.fetch(wait=20))
+        await asyncio.sleep(0.25)
+        receipt = alice.seal_to(bob.certificate, b'{"kind":"deliveryReceipt","sentAt":1}')
+        await alice.deposit(receipt, notify=False)
+        batch = await asyncio.wait_for(fetch_task, 10)
+        self.assertEqual([item["id"] for item in batch], [receipt["id"]])
+
+        # Never acknowledged, as if the app closed mid-poll: still no push.
+        await asyncio.sleep(0.4)
+        self.assertEqual(push.sent, [])
+
+    @async_test
+    async def test_a_malformed_notify_flag_is_refused(self):
+        push = FakePush()
+        await self.start_server(push=push)
+        alice, bob = await self._pair()
+        await bob.set_push_token(TOKEN_A)
+
+        env = alice.seal_to(bob.certificate, b'{"kind":"text","sentAt":1}')
+        for value in ('{"notify":"no"}', "[]", "not json"):
+            with self.assertRaises(ServerError) as ctx:
+                await alice.request(bs.T_RELAY_DEPOSIT, envelope=env,
+                                    recipient_phone=BOB, value=value)
+            self.assertEqual(ctx.exception.code, "bad_request")
+
+        # Refused before anything was stored or pushed.
+        self.assertFalse(self.server.queue.get(BOB))
+        await asyncio.sleep(0.05)
+        self.assertEqual(push.sent, [])
+
+    @async_test
     async def test_a_dead_token_is_dropped(self):
         push = FakePush(drop=True)
         await self.start_server(push=push)
