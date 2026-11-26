@@ -2,7 +2,7 @@
 """
 Minimal async hoppin client.
 
-Used by server/test_bootstrap.py, and usable by hand for smoke testing a
+Used by tests/test_bootstrap.py, and usable by hand for smoke testing a
 deployment. It implements the client half of §1-§4 of the design contract:
 canonical encoding, certificate handling, wire signing, and envelope sealing.
 

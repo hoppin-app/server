@@ -9,7 +9,7 @@
 #   # /opt/hoppin, create the venv:
 #   sudo -u hoppin python3 -m venv /opt/hoppin/venv
 #   sudo -u hoppin /opt/hoppin/venv/bin/pip install -r /opt/hoppin/requirements.txt
-#   sudo cp server/hoppin-bootstrap.service /etc/systemd/system/
+#   sudo cp deploy/hoppin-bootstrap.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now hoppin-bootstrap
 #
 # Secrets (TWILIO_AUTH_TOKEN etc.) go in /etc/hoppin/bootstrap.env, mode 600,

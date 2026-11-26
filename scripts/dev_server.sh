@@ -24,7 +24,7 @@ TLS_DIR="${TLS_DIR:-$ROOT/tls}"
 
 if [[ ! -f "$TLS_DIR/cert.pem" || ! -f "$TLS_DIR/key.pem" ]]; then
     echo "No certificate yet — generating one (valid 825 days)…"
-    ./server/gen_tls_cert.sh localhost "$TLS_DIR" 825
+    ./deploy/gen_tls_cert.sh localhost "$TLS_DIR" 825
     echo
 fi
 

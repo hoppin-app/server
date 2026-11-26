@@ -8,7 +8,7 @@
    read, holds them per recipient, and hands them over on an authenticated
    long-poll fetch.
 
-It implements §1–§5 of [`docs/DESIGN_CONTRACT.md`](../docs/DESIGN_CONTRACT.md).
+It implements §1–§5 of [`DESIGN_CONTRACT.md`](../docs/DESIGN_CONTRACT.md) in the docs repo.
 
 **What it deliberately does not do:** no peer lists, no phone→IP lookup, no DHT
 `store`/`findValue`, no hole punching, no unauthenticated state changes, and no
@@ -79,7 +79,7 @@ server public key (pin this in AppConfig.serverSigningKeyBase64): <base64>
 Smoke test it with the bundled client:
 
 ```sh
-./venv/bin/python server/client.py --host 127.0.0.1 --port 4001 \
+./venv/bin/python tools/client.py --host 127.0.0.1 --port 4001 \
     --phone +351912345678 --code 123456
 ```
 
@@ -100,7 +100,7 @@ export TWILIO_ACCOUNT_SID=AC... TWILIO_AUTH_TOKEN=... TWILIO_FROM='+1...'
 ## TLS and the SPKI pin
 
 ```sh
-./server/gen_tls_cert.sh hoppin.example.com ./tls 825
+./deploy/gen_tls_cert.sh hoppin.example.com ./tls 825
 ```
 
 This writes `cert.pem` + `key.pem` (mode 600) and prints the pin. To extract the
@@ -172,18 +172,19 @@ enum AppConfig {
 ## Tests and fixtures
 
 ```sh
-./venv/bin/python -m unittest discover -s server -v
+./venv/bin/python -m unittest discover -s tests -v
 ./venv/bin/python -m py_compile bootstrap.py
 ```
 
 The suite starts a real server in-process on ephemeral ports (plaintext and TLS)
-and drives it over real sockets via `server/client.py`.
+and drives it over real sockets via `tools/client.py`.
 
-`server/make_vectors.py` regenerates `docs/fixtures/crypto_vectors.json`, the
+`make_vectors.py` in the lib repo regenerates `fixtures/crypto_vectors.json`, the
 cross-language test vectors the Swift target consumes. It is fully
 deterministic — every key derives from SHA-256 of a fixed ASCII label — so
 re-running it must leave the file byte-identical, and a test asserts exactly
-that. Regenerate it whenever the canonical encoding, certificate format,
+that. The fixture tests look for the lib repo at `$HOPPIN_LIB_DIR`, `./lib`
+or `../lib`, and skip without it. Regenerate it whenever the canonical encoding, certificate format,
 envelope sealing or safety-number algorithm changes, and tell the app side.
 
 ---
@@ -201,4 +202,4 @@ envelope sealing or safety-number algorithm changes, and tell the app side.
   user-consented plaintext evidence — treat that file as sensitive.
 * **Acting on reports**: `hoppin_admin.py` (next to `bootstrap.py`) lists
   reports and edits the ban file — `reports [--since 24h]`, `ban <E.164>
-  [note]`, `unban <E.164>`, `banned`. See `docs/DEPLOY.md` §6d.
+  [note]`, `unban <E.164>`, `banned`. See `ops/DEPLOY.md` §6d in the docs repo.

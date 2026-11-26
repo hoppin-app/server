@@ -1,0 +1,19 @@
+# Python
+/venv
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets and runtime state: never commit
+/keys
+/bootstrap_identity.key
+/bootstrap_state.json
+/reports.jsonl
+/tls/
+*.state.json
+.env*
+
+# The lib repo, when CI checks it out inside this one for the fixtures.
+/lib/
+
+.DS_Store

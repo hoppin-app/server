@@ -4,7 +4,7 @@
 # hoppin bootstrap server, and print the SPKI pin the iOS app must pin.
 #
 # Usage:
-#   ./server/gen_tls_cert.sh [COMMON_NAME] [OUT_DIR] [DAYS]
+#   ./deploy/gen_tls_cert.sh [COMMON_NAME] [OUT_DIR] [DAYS]
 #
 #   COMMON_NAME  hostname or IP clients connect to (default: localhost)
 #   OUT_DIR      where cert.pem / key.pem are written (default: ./tls)

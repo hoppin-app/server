@@ -5,7 +5,7 @@ Tests for the hoppin bootstrap server.
 Run:  ./venv/bin/python -m unittest discover -s server -v
 
 Every test starts a real BootstrapServer in-process on an ephemeral port and
-talks to it over a real socket with server/client.py, so the framing, TLS,
+talks to it over a real socket with tools/client.py, so the framing, TLS,
 signing and rate limiting paths are all exercised end to end.
 """
 
@@ -33,12 +33,30 @@ from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-for path in (_ROOT, _HERE):
+for path in (_ROOT, os.path.join(_ROOT, "tools"), _HERE):
     if path not in sys.path:
         sys.path.insert(0, path)
 
 # The server reads HOPPIN_ENV at import time.
 os.environ.setdefault("HOPPIN_ENV", "dev")
+
+
+def _find_lib():
+    """The lib repo (fixtures + make_vectors.py): $HOPPIN_LIB_DIR, ./lib
+    (checked out inside this repo, as CI does), or ../lib (the hoppin
+    parent checkout)."""
+    candidates = (os.environ.get("HOPPIN_LIB_DIR", ""),
+                  os.path.join(_ROOT, "lib"),
+                  os.path.join(os.path.dirname(_ROOT), "lib"))
+    for candidate in candidates:
+        if candidate and os.path.exists(
+                os.path.join(candidate, "fixtures", "crypto_vectors.json")):
+            return candidate
+    return os.path.join(os.path.dirname(_ROOT), "lib")
+
+
+_LIB = _find_lib()
+_FIXTURES = os.path.join(_LIB, "fixtures", "crypto_vectors.json")
 
 import bootstrap as bs  # noqa: E402
 import apns as bsapns  # noqa: E402
@@ -208,7 +226,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(bs.copt(None), "")
 
     def test_matches_generated_fixtures(self):
-        path = os.path.join(_ROOT, "docs", "fixtures", "crypto_vectors.json")
+        path = _FIXTURES
         if not os.path.exists(path):
             self.skipTest("fixtures not generated yet")
         with open(path, "r", encoding="utf-8") as fh:
@@ -1526,7 +1544,7 @@ class FixtureTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.path = os.path.join(_ROOT, "docs", "fixtures", "crypto_vectors.json")
+        cls.path = _FIXTURES
         cls.vectors = None
         if os.path.exists(cls.path):
             with open(cls.path, "r", encoding="utf-8") as fh:
@@ -1534,7 +1552,8 @@ class FixtureTests(unittest.TestCase):
 
     def setUp(self):
         if self.vectors is None:
-            self.skipTest("run server/make_vectors.py first")
+            self.skipTest("lib repo not found: set HOPPIN_LIB_DIR, or check it out "
+                          "next to this repo")
 
     def test_certificates_verify_against_the_fixture_server_key(self):
         server_pub = self.vectors["server"]["publicKeyBase64"]
@@ -1593,8 +1612,9 @@ class FixtureTests(unittest.TestCase):
         with open(self.path, "rb") as fh:
             before = fh.read()
         result = subprocess.run(
-            [sys.executable, os.path.join(_HERE, "make_vectors.py")],
-            capture_output=True)
+            [sys.executable, os.path.join(_LIB, "make_vectors.py")],
+            capture_output=True,
+            env=dict(os.environ, HOPPIN_SERVER_DIR=_ROOT))
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         with open(self.path, "rb") as fh:
             self.assertEqual(before, fh.read(), "fixtures are not deterministic")

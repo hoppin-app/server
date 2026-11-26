@@ -2,7 +2,7 @@
 """
 hoppin bootstrap server (v2).
 
-Implements docs/DESIGN_CONTRACT.md sections 1-5:
+Implements DESIGN_CONTRACT.md (docs repo) sections 1-5:
 
   * §1 canonical length-prefixed signing encoding
   * §2 identity certificates signed by the server Ed25519 key
