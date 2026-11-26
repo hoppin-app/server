@@ -17,3 +17,7 @@ __pycache__/
 /lib/
 
 .DS_Store
+
+# CI output
+/build/
+.coverage
